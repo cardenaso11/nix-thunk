@@ -1,6 +1,3 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
-
 module Nix.Thunk.Command where
 
 import Cli.Extras (HasCliConfig, Output)
