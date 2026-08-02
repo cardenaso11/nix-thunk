@@ -591,12 +591,16 @@ dirAttr = AttrName "dir"
 -- | Collapse @.@ and @..@ segments. 'Nothing' when the path climbs out of the
 -- tree it started in, which cannot be expressed as a subdirectory of a repo.
 normaliseRelative :: FilePath -> Maybe FilePath
-normaliseRelative = fmap joinPath . foldM step [] . splitDirectories
+normaliseRelative = fmap (joinPath . reverse) . foldM step [] . splitDirectories
   where
+    -- Innermost segment first, so that @..@ is a total pattern match rather
+    -- than a partial `init`.
     step acc = \case
       "." -> Just acc
-      ".." -> if null acc then Nothing else Just $ init acc
-      seg -> Just $ acc <> [seg]
+      ".." -> case acc of
+        [] -> Nothing
+        _innermost : outer -> Just outer
+      seg -> Just $ seg : acc
 
 -- | Keep only the attributes of a locked node that describe /how to fetch it/,
 -- and so are meaningful when copied into an input. Everything else a lock
