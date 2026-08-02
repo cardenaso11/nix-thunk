@@ -12,7 +12,7 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
-            experimental-features = nix-command
+            experimental-features = nix-command flakes
             extra-substituters = https://cache.iog.io https://nixcache.reflex-frp.org
             extra-trusted-public-keys = hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ= ${{ vars.NIX_CACHE_PUBLIC_KEY }}
       - name: Build

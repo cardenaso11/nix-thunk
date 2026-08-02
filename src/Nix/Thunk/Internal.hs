@@ -64,7 +64,10 @@ import System.FilePath
 import System.IO.Error (isDoesNotExistError)
 import System.IO.Temp
 import System.Posix.Files
+import System.Which (staticWhich)
 import Text.URI qualified as URI
+
+import Nix.Thunk.Flake qualified as Flake
 
 --------------------------------------------------------------------------------
 -- Hacks
@@ -169,6 +172,11 @@ gitUriToText (GitUri uri)
       "/" <> T.intercalate "/" (map URI.unRText $ NonEmpty.toList path)
   | otherwise = URI.render uri
 
+-- | Unlike 'gitUriToText', which drops the scheme from a @file@ URI so that the
+-- generated loaders get a bare path, a flake reference needs the URL in full.
+flakeUriToText :: GitUri -> Text
+flakeUriToText = URI.render . unGitUri
+
 data GitSource = GitSource
   { _gitSource_url :: GitUri
   , _gitSource_branch :: Maybe (Name Branch)
@@ -264,11 +272,13 @@ getNixSha256ForUriUnpacked
   -> m NixSha256
 getNixSha256ForUriUnpacked uri =
   withExitFailMessage ("nix-prefetch-url: Failed to determine sha256 hash of URL " <> gitUriToText uri) $ do
-    [hash] <-
+    out <-
       fmap T.lines $
         readProcessAndLogOutput (Debug, Debug) $
           Cli.proc nixPrefetchUrlPath ["--unpack", "--type", "sha256", T.unpack $ gitUriToText uri]
-    pure hash
+    case out of
+      [hash] -> pure hash
+      _ -> failWith $ "nix-prefetch-url: unrecognized output " <> T.unlines out
 
 nixPrefetchGit :: MonadNixThunk m => GitUri -> Text -> Bool -> m NixSha256
 nixPrefetchGit uri rev fetchSubmodules =
@@ -360,6 +370,16 @@ unpackedDirName = "."
 attrCacheFileName :: FilePath
 attrCacheFileName = ".attr-cache"
 
+-- | Thunk files are written as UTF-8 whatever the ambient locale is. Their
+-- content is derived from the repository being packed, so URLs, owner and
+-- repository names, and lock node ids need not be ASCII, and the process
+-- encoding under @LC_ALL=C@ would reject them halfway through a write.
+writeUtf8File :: FilePath -> Text -> IO ()
+writeUtf8File path = BSC.writeFile path . encodeUtf8
+
+appendUtf8File :: FilePath -> Text -> IO ()
+appendUtf8File path = BSC.appendFile path . encodeUtf8
+
 -- | A path from which our known-good nixpkgs can be fetched.
 -- __NOTE__: This path is hardcoded, and only exists so subsumed thunk
 -- specs (v7 specifically) can be parsed.
@@ -372,10 +392,22 @@ data ThunkFileSpec
     ThunkFileSpec_Ptr (LBS.ByteString -> Either String ThunkPtr)
   | -- | This file must match the given content exactly
     ThunkFileSpec_FileMatches Text
+  | -- | This file is derived from the repository the thunk points at
+    ThunkFileSpec_Generated ThunkGeneratedFile
   | -- | Existence of this directory indicates that the thunk is unpacked
     ThunkFileSpec_CheckoutIndicator
   | -- | This directory is an attribute cache
     ThunkFileSpec_AttrCache
+
+-- | A file whose content depends on the repository a thunk points at, and so
+-- cannot be compared against a fixed string. Reading a thunk only checks that
+-- these are present; 'createThunk' is what produces their content. A thunk
+-- whose generated files have been damaged is repaired by unpacking and packing
+-- it again.
+data ThunkGeneratedFile
+  = ThunkGeneratedFile_FlakeNix
+  | ThunkGeneratedFile_FlakeLock
+  deriving stock (Eq, Ord, Show)
 
 -- | Specification for how a set of files in a thunk version work.
 data ThunkSpec = ThunkSpec
@@ -406,6 +438,10 @@ matchThunkSpecToDir thunkSpec dir dirFiles = do
       datas <- fmap toList $ flip Map.traverseMaybeWithKey (_thunkSpec_files thunkSpec) $ \expectedPath -> \case
         ThunkFileSpec_AttrCache -> Nothing <$ dirMayExist expectedPath
         ThunkFileSpec_CheckoutIndicator -> pure Nothing -- Handled above
+        -- Generated files depend on the repository the thunk points at, so
+        -- there is nothing to compare them against. Presence is enforced by
+        -- 'isRequiredFileSpec' below.
+        ThunkFileSpec_Generated _ -> pure Nothing
         ThunkFileSpec_FileMatches expectedContents -> handle (\(e :: IOError) -> throwError $ ReadThunkError_FileError expectedPath e) $ do
           actualContents <- liftIO (T.readFile $ dir </> expectedPath)
           case T.strip expectedContents == T.strip actualContents of
@@ -439,6 +475,7 @@ matchThunkSpecToDir thunkSpec dir dirFiles = do
     requiredPaths = rootPathsOnly $ Map.filter isRequiredFileSpec $ _thunkSpec_files thunkSpec
     isRequiredFileSpec = \case
       ThunkFileSpec_FileMatches _ -> True
+      ThunkFileSpec_Generated _ -> True
       _ -> False
 
     dirMayExist expectedPath =
@@ -501,7 +538,8 @@ parseGitHubSource v = do
 
 parseGitSource :: Aeson.Object -> Aeson.Parser GitSource
 parseGitSource v = do
-  Just url <- parseGitUri <$> v Aeson..: "url"
+  rawUrl <- v Aeson..: "url"
+  url <- maybe (fail $ "could not parse git URI " <> T.unpack rawUrl) pure $ parseGitUri rawUrl
   branch <- v Aeson..:! "branch"
   fetchSubmodules <- v Aeson..:! "fetchSubmodules"
   private <- v Aeson..:? "private"
@@ -616,11 +654,18 @@ createThunk target ptrInfo = do
     unless isempty $ failWith $ "Refusing to create thunk in non-empty directory " <> T.pack target
 
   ifor_ (_thunkSpec_files spec) $ \path -> \case
-    ThunkFileSpec_FileMatches content -> withReadyPath path $ \p -> liftIO $ T.writeFile p content
+    ThunkFileSpec_FileMatches content -> withReadyPath path $ \p -> liftIO $ writeUtf8File p content
     ThunkFileSpec_Ptr _ -> case ptrInfo of
       Left _ -> pure () -- We can't write the ptr without it
       Right ptr -> withReadyPath path $ \p -> liftIO $ LBS.writeFile p (encodeThunkPtrData ptr)
+    -- Written below: these are derived from the repository the thunk points
+    -- at, which cannot be fetched until the loaders above have been written.
+    ThunkFileSpec_Generated _ -> pure ()
     _ -> pure ()
+
+  case ptrInfo of
+    Left _ -> pure () -- We can't fetch the source without the ptr
+    Right ptr -> when (specHasFlakeFiles spec) $ writeThunkFlakeFiles target ptr
   where
     spec = either id thunkPtrToSpec ptrInfo
     withReadyPath path f = do
@@ -628,6 +673,155 @@ createThunk target ptrInfo = do
       putLog Debug $ "Writing thunk file " <> T.pack fullPath
       liftIO $ createDirectoryIfMissing True $ takeDirectory fullPath
       f fullPath
+
+specHasFlakeFiles :: ThunkSpec -> Bool
+specHasFlakeFiles = any isGenerated . _thunkSpec_files
+  where
+    isGenerated = \case ThunkFileSpec_Generated _ -> True; _ -> False
+
+-- | Generate the flake files of a packed thunk.
+writeThunkFlakeFiles :: MonadNixThunk m => FilePath -> ThunkPtr -> m ()
+writeThunkFlakeFiles target ptr = do
+  let srcRef = thunkPtrToFlakeRef ptr
+  srcPath <- fetchFlakeRef srcRef
+  liftIO (doesFileExist $ srcPath </> flakeNixFileName) >>= \case
+    False -> do
+      liftIO $ writeUtf8File (target </> flakeNixFileName) $ Flake.renderSourceOnlyFlakeNix srcRef
+      nixFlakeLock target
+    True -> do
+      lock <- upstreamFlakeLock srcPath
+      liftIO $
+        writeUtf8File (target </> flakeNixFileName) $
+          Flake.renderFlakeNix $
+            Flake.flattenLock srcRef lock
+      nixFlakeLock target
+
+-- | Fetch the repository a reference points at, and return its store path.
+--
+-- This deliberately goes through the same fetcher the generated flake will
+-- use, rather than through the thunk's own @thunk.nix@: it means a reference
+-- that Nix cannot resolve is caught while packing rather than by whoever tries
+-- to use the thunk. The revision is pinned, so the fetch is cached.
+fetchFlakeRef :: MonadNixThunk m => Flake.FlakeRef -> m FilePath
+fetchFlakeRef srcRef = do
+  let expr = "(builtins.fetchTree " <> Flake.renderFlakeRefExpr srcRef <> ").outPath"
+  out <-
+    withExitFailMessage ("nix eval: Failed to fetch " <> Flake.renderFlakeRefExpr srcRef) $
+      readProcessAndLogStderr Debug $
+        Cli.proc nixExePath $
+          flakeArgs <> ["eval", "--impure", "--raw", "--expr", T.unpack expr]
+  pure $ T.unpack $ T.strip out
+
+-- | Upstream's own lock, which is what pins the revisions the thunk reproduces.
+-- An upstream shipping no lock has pinned nothing, so there is no alternative
+-- to resolving its inputs here and now.
+upstreamFlakeLock :: MonadNixThunk m => FilePath -> m Flake.FlakeLock
+upstreamFlakeLock srcPath = do
+  stored <- liftIO $ try @IOError $ BSC.readFile $ srcPath </> flakeLockFileName
+  case stored of
+    Right bytes -> either unparseable pure $ Aeson.eitherDecodeStrict bytes
+    Left e
+      | not (isDoesNotExistError e) ->
+          failWith $
+            "Could not read the "
+              <> T.pack flakeLockFileName
+              <> " of "
+              <> T.pack srcPath
+              <> ":\n"
+              <> T.pack (show e)
+    Left _ -> do
+      putLog Warning $
+        T.pack srcPath
+          <> " has no "
+          <> T.pack flakeLockFileName
+          <> "; its inputs will be pinned as of now rather than as upstream pinned them."
+      flakeMetadata_locks <$> nixFlakeMetadata srcPath
+  where
+    unparseable e =
+      failWith $
+        "Could not parse the " <> T.pack flakeLockFileName <> " of " <> T.pack srcPath <> ":\n" <> T.pack e
+
+newtype FlakeMetadata = FlakeMetadata
+  { flakeMetadata_locks :: Flake.FlakeLock
+  }
+
+instance Aeson.FromJSON FlakeMetadata where
+  parseJSON = Aeson.withObject "FlakeMetadata" $ \o -> FlakeMetadata <$> o Aeson..: "locks"
+
+nixFlakeMetadata :: MonadNixThunk m => FilePath -> m FlakeMetadata
+nixFlakeMetadata srcPath = do
+  out <-
+    withExitFailMessage ("nix flake metadata: Failed to resolve the inputs of " <> T.pack srcPath) $
+      readProcessAndLogStderr Debug $
+        Cli.proc nixExePath $
+          flakeArgs
+            <> ["flake", "metadata", "--json", "--no-write-lock-file", flakePathRef srcPath]
+  case Aeson.eitherDecodeStrict $ encodeUtf8 out of
+    Right v -> pure v
+    Left e -> failWith $ "nix flake metadata: unrecognized output:\n" <> T.pack e
+
+nixFlakeLock :: MonadNixThunk m => FilePath -> m ()
+nixFlakeLock target =
+  withExitFailMessage ("nix flake lock: Failed to lock the flake of thunk " <> T.pack target) $
+    callProcessAndLogOutput (Debug, Debug) $
+      Cli.proc nixExePath $
+        flakeArgs <> ["flake", "lock", flakePathRef target]
+
+-- | Packing a thunk should not depend on how the user has configured Nix, so
+-- the features these commands need are requested explicitly.
+flakeArgs :: [String]
+flakeArgs = ["--extra-experimental-features", "nix-command flakes"]
+
+-- | Name a directory in a way Nix reads as a path.
+--
+-- Nix matches its flake-id syntax before its path syntax, so a bare relative
+-- argument like @dep\/foo@ is looked up in the flake registries instead. The
+-- prefix also keeps Nix from resolving a directory inside a git work tree
+-- through that repository, where it would see only tracked files and so miss
+-- the @flake.nix@ that has just been written.
+flakePathRef :: FilePath -> String
+flakePathRef = ("path:" <>)
+
+nixExePath :: FilePath
+nixExePath = $(staticWhich "nix")
+
+-- | The flake reference for the repository a thunk points at.
+--
+-- The @github@ fetcher can neither fetch submodules nor authenticate against a
+-- private repository, so both of those fall back to the plain @git@ fetcher
+-- over the ssh URL that 'forgetGithub' produces.
+thunkPtrToFlakeRef :: ThunkPtr -> Flake.FlakeRef
+thunkPtrToFlakeRef (ThunkPtr rev src) = case src of
+  ThunkSource_GitHub s
+    | _gitHubSource_private s -> gitRef $ forgetGithub True s
+    -- No @ref@: the @github@ fetcher rejects a reference carrying both a
+    -- revision and a branch, and the revision alone identifies the tree,
+    -- since GitHub serves an archive of any revision regardless of branch.
+    | otherwise ->
+        flakeRef
+          [ ("type", str "github")
+          , ("owner", str $ untagName $ _gitHubSource_owner s)
+          , ("repo", str $ untagName $ _gitHubSource_repo s)
+          , ("rev", str commit)
+          ]
+  ThunkSource_Git s -> gitRef s
+  where
+    commit = T.pack $ refToHexString $ _thunkRev_commit rev
+    str = Flake.FlakeRefValue_String
+    flakeRef = Flake.FlakeRef . Map.fromList . fmap (first Flake.AttrName)
+    gitRef s =
+      flakeRef $
+        catMaybes
+          [ Just ("type", str "git")
+          , Just ("url", str $ flakeUriToText $ _gitSource_url s)
+          , Just ("rev", str commit)
+          , Just $ case _gitSource_branch s of
+              Just b -> ("ref", str $ untagName b)
+              -- Without a branch the revision need not be reachable from the
+              -- default one, exactly as in the v9 loader's `allRefs = branch == null`.
+              Nothing -> ("allRefs", Flake.FlakeRefValue_Bool True)
+          , ("submodules", Flake.FlakeRefValue_Bool True) <$ guard (_gitSource_fetchSubmodules s)
+          ]
 
 updateThunkToLatest :: MonadNixThunk m => ThunkUpdateConfig -> FilePath -> m ()
 updateThunkToLatest cfg target = do
@@ -663,8 +857,9 @@ updateThunkToLatest cfg target = do
 -- This tool will only ever produce the newest one when it writes a thunk.
 gitHubThunkSpecs :: NonEmpty ThunkSpec
 gitHubThunkSpecs =
-  gitHubThunkSpecV8
-    :| [ gitHubThunkSpecV7
+  gitHubThunkSpecV9
+    :| [ gitHubThunkSpecV8
+       , gitHubThunkSpecV7
        , gitHubThunkSpecV6
        , gitHubThunkSpecV5
        , gitHubThunkSpecV4
@@ -819,25 +1014,31 @@ gitHubThunkSpecV7 =
 -- nixpkgs tarball from GitHub, so it will fail on environments without
 -- a network connection.
 gitHubThunkSpecV8 :: ThunkSpec
-gitHubThunkSpecV8 =
-  mkThunkSpec
-    "github-v8"
-    "github.json"
-    parseGitHubJsonBytes
-    """
-    # DO NOT HAND-EDIT THIS FILE
-    let fetch = { private ? false, fetchSubmodules ? false, owner, repo, rev, sha256, ... }:
-      if !fetchSubmodules && !private then builtins.fetchTarball {
-        url = "https://github.com/${owner}/${repo}/archive/${rev}.tar.gz"; inherit sha256;
-      } else (import (builtins.fetchTarball {
-      url = "https://github.com/NixOS/nixpkgs/archive/3aad50c30c826430b0270fcf8264c8c41b005403.tar.gz";
-      sha256 = "0xwqsf08sywd23x0xvw4c4ghq0l28w2ki22h0bdn766i16z9q2gr";
-    }) {}).fetchFromGitHub {
-        inherit owner repo rev sha256 fetchSubmodules private;
-      };
-      json = builtins.fromJSON (builtins.readFile ./github.json);
-    in fetch json
-    """
+gitHubThunkSpecV8 = mkThunkSpec "github-v8" "github.json" parseGitHubJsonBytes gitHubLoaderV8
+
+-- | Adds the generated flake files to 'gitHubThunkSpecV8'. The loader is
+-- unchanged: a v9 thunk fetches exactly like a v8 one, and only differs in
+-- also being usable as a flake input.
+gitHubThunkSpecV9 :: ThunkSpec
+gitHubThunkSpecV9 = mkFlakeThunkSpec "github-v9" "github.json" parseGitHubJsonBytes gitHubLoaderV8
+
+-- | Shared by 'gitHubThunkSpecV8' and 'gitHubThunkSpecV9'.
+gitHubLoaderV8 :: Text
+gitHubLoaderV8 =
+  """
+  # DO NOT HAND-EDIT THIS FILE
+  let fetch = { private ? false, fetchSubmodules ? false, owner, repo, rev, sha256, ... }:
+    if !fetchSubmodules && !private then builtins.fetchTarball {
+      url = "https://github.com/${owner}/${repo}/archive/${rev}.tar.gz"; inherit sha256;
+    } else (import (builtins.fetchTarball {
+    url = "https://github.com/NixOS/nixpkgs/archive/3aad50c30c826430b0270fcf8264c8c41b005403.tar.gz";
+    sha256 = "0xwqsf08sywd23x0xvw4c4ghq0l28w2ki22h0bdn766i16z9q2gr";
+  }) {}).fetchFromGitHub {
+      inherit owner repo rev sha256 fetchSubmodules private;
+    };
+    json = builtins.fromJSON (builtins.readFile ./github.json);
+  in fetch json
+  """
 
 parseGitHubJsonBytes :: LBS.ByteString -> Either String ThunkPtr
 parseGitHubJsonBytes = parseJsonObject $ parseThunkPtr $ \v ->
@@ -845,8 +1046,9 @@ parseGitHubJsonBytes = parseJsonObject $ parseThunkPtr $ \v ->
 
 gitThunkSpecs :: NonEmpty ThunkSpec
 gitThunkSpecs =
-  gitThunkSpecV9
-    :| [ gitThunkSpecV8
+  gitThunkSpecV10
+    :| [ gitThunkSpecV9
+       , gitThunkSpecV8
        , gitThunkSpecV7
        , gitThunkSpecV6
        , gitThunkSpecV5
@@ -1050,34 +1252,61 @@ gitThunkSpecV8 =
 -- | Improves V8 by supporting retrieving revs from any branch, when a branch is not provided
 -- Previously, it would only work for revs that were present on the default branch
 gitThunkSpecV9 :: ThunkSpec
-gitThunkSpecV9 =
-  mkThunkSpec
-    "git-v9"
-    "git.json"
-    parseGitHubJsonBytes
-    """
-    # DO NOT HAND-EDIT THIS FILE
-    let fetch = {url, rev, branch ? null, sha256 ? null, fetchSubmodules ? false, private ? false, ...}:
-      let realUrl = let firstChar = builtins.substring 0 1 url; in
-        if firstChar == "/" then /. + url
-        else if firstChar == "." then ./. + url
-        else url;
-      in if !fetchSubmodules && private then builtins.fetchGit {
-        url = realUrl; inherit rev;
-        ${if branch == null then null else "ref"} = branch;
-        allRefs = branch == null;
-      } else (import (builtins.fetchTarball {
-        url = "https://github.com/NixOS/nixpkgs/archive/3aad50c30c826430b0270fcf8264c8c41b005403.tar.gz";
-        sha256 = "0xwqsf08sywd23x0xvw4c4ghq0l28w2ki22h0bdn766i16z9q2gr";
-      }) {}).fetchgit {
-        url = realUrl; inherit rev sha256;
-      };
-      json = builtins.fromJSON (builtins.readFile ./git.json);
-    in fetch json
-    """
+gitThunkSpecV9 = mkThunkSpec "git-v9" "git.json" parseGitHubJsonBytes gitLoaderV9
+
+-- | Adds the generated flake files to 'gitThunkSpecV9'. The loader is
+-- unchanged: a v10 thunk fetches exactly like a v9 one, and only differs in
+-- also being usable as a flake input.
+gitThunkSpecV10 :: ThunkSpec
+gitThunkSpecV10 = mkFlakeThunkSpec "git-v10" "git.json" parseGitHubJsonBytes gitLoaderV9
+
+-- | Shared by 'gitThunkSpecV9' and 'gitThunkSpecV10'.
+gitLoaderV9 :: Text
+gitLoaderV9 =
+  """
+  # DO NOT HAND-EDIT THIS FILE
+  let fetch = {url, rev, branch ? null, sha256 ? null, fetchSubmodules ? false, private ? false, ...}:
+    let realUrl = let firstChar = builtins.substring 0 1 url; in
+      if firstChar == "/" then /. + url
+      else if firstChar == "." then ./. + url
+      else url;
+    in if !fetchSubmodules && private then builtins.fetchGit {
+      url = realUrl; inherit rev;
+      ${if branch == null then null else "ref"} = branch;
+      allRefs = branch == null;
+    } else (import (builtins.fetchTarball {
+      url = "https://github.com/NixOS/nixpkgs/archive/3aad50c30c826430b0270fcf8264c8c41b005403.tar.gz";
+      sha256 = "0xwqsf08sywd23x0xvw4c4ghq0l28w2ki22h0bdn766i16z9q2gr";
+    }) {}).fetchgit {
+      url = realUrl; inherit rev sha256;
+    };
+    json = builtins.fromJSON (builtins.readFile ./git.json);
+  in fetch json
+  """
 
 parseGitJsonBytes :: LBS.ByteString -> Either String ThunkPtr
 parseGitJsonBytes = parseJsonObject $ parseThunkPtr $ fmap ThunkSource_Git . parseGitSource
+
+-- | As 'mkThunkSpec', but the packed thunk is also a flake: alongside the
+-- loaders it carries a generated @flake.nix@ exposing the inputs of the
+-- repository it points at, and the @flake.lock@ pinning them.
+mkFlakeThunkSpec :: Text -> FilePath -> (LBS.ByteString -> Either String ThunkPtr) -> Text -> ThunkSpec
+mkFlakeThunkSpec name jsonFileName parser srcNix =
+  let spec = mkThunkSpec name jsonFileName parser srcNix
+  in spec
+       { _thunkSpec_files =
+           _thunkSpec_files spec
+             <> Map.fromList
+               [ (flakeNixFileName, ThunkFileSpec_Generated ThunkGeneratedFile_FlakeNix)
+               , (flakeLockFileName, ThunkFileSpec_Generated ThunkGeneratedFile_FlakeLock)
+               ]
+       }
+
+flakeNixFileName :: FilePath
+flakeNixFileName = "flake.nix"
+
+flakeLockFileName :: FilePath
+flakeLockFileName = "flake.lock"
 
 mkThunkSpec :: Text -> FilePath -> (LBS.ByteString -> Either String ThunkPtr) -> Text -> ThunkSpec
 mkThunkSpec name jsonFileName parser srcNix =
@@ -1264,14 +1493,64 @@ unpackThunk' noTrail thunkDir =
             let unpackedPath = tmpThunk </> unpackedDirName
             gitCloneForThunkUnpack gitSrc (_thunkRev_commit $ _thunkPtr_rev tptr) unpackedPath
 
+            when (specHasFlakeFiles newSpec) $ preserveFlakeInterface unpackedPath
+
             let normalizeMore = dropTrailingPathSeparator . normalise
-            when (normalizeMore unpackedPath /= normalizeMore tmpThunk) $ -- Only write meta data if the checkout is not inplace
+            -- Only write meta data if the checkout is not inplace
+            when (normalizeMore unpackedPath /= normalizeMore tmpThunk) $
               createThunk tmpThunk $
                 Left newSpec
 
             liftIO $ do
               removePathForcibly thunkDir
               renameDirectory tmpThunk thunkDir
+
+-- | A packed thunk of a repository that is not itself a flake still exposes
+-- the fetched source as a flake output. Unpacking replaces the thunk with a
+-- bare checkout, which would leave anyone consuming it as a flake input with
+-- nothing to resolve, so the same interface is written into the checkout.
+--
+-- Nothing is written when the repository brings its own @flake.nix@: that one
+-- is the better answer, and shadowing it would corrupt the working tree. The
+-- generated files are hidden through @.git\/info\/exclude@ rather than a
+-- tracked ignore file, so the checkout still reads as clean and they cannot be
+-- committed by accident.
+preserveFlakeInterface :: MonadNixThunk m => FilePath -> m ()
+preserveFlakeInterface checkout = do
+  hasOwnFlake <- liftIO $ doesFileExist $ checkout </> flakeNixFileName
+  unless hasOwnFlake $ do
+    putLog Debug $ "Writing flake files into checkout " <> T.pack checkout
+    liftIO $ do
+      writeUtf8File (checkout </> flakeNixFileName) Flake.unpackedSourceFlakeNix
+      writeUtf8File (checkout </> flakeLockFileName) Flake.emptyFlakeLock
+      let excludeFile = checkout </> ".git" </> "info" </> "exclude"
+      createDirectoryIfMissing True $ takeDirectory excludeFile
+      appendUtf8File excludeFile $
+        T.unlines
+          [ ""
+          , "# Written by nix-thunk; removed when the thunk is packed."
+          , "/" <> T.pack flakeNixFileName
+          , "/" <> T.pack flakeLockFileName
+          ]
+
+-- | Undo 'preserveFlakeInterface' before the checkout is inspected for
+-- modifications, since the cleanliness check counts ignored files as unsaved
+-- work. Only files whose content is exactly what was written are removed, so a
+-- flake the user has since written by hand is left alone and still reported.
+discardPreservedFlakeInterface :: MonadNixThunk m => FilePath -> m ()
+discardPreservedFlakeInterface checkout =
+  for_
+    ( [ (flakeNixFileName, Flake.unpackedSourceFlakeNix)
+      , (flakeLockFileName, Flake.emptyFlakeLock)
+      ]
+        :: [(FilePath, Text)]
+    )
+    $ \(name, written) -> do
+      let path = checkout </> name
+      contents <- liftIO $ rightToMaybe <$> try @IOError (T.readFile path)
+      when (fmap T.strip contents == Just (T.strip written)) $ do
+        putLog Debug $ "Removing generated " <> T.pack path
+        liftIO $ removePathForcibly path
 
 gitCloneForThunkUnpack
   :: MonadNixThunk m
@@ -1408,21 +1687,30 @@ packThunk' noTrail (ThunkPackConfig force thunkConfig) thunkDir =
       ("Packing thunk " <> T.pack thunkDir)
       (finalMsg noTrail $ const $ "Packed thunk " <> T.pack thunkDir)
       $ do
+        discardPreservedFlakeInterface thunkDir
         let checkClean = if force then CheckClean_NoCheck else CheckClean_FullCheck
         (thunkPtr, isWorktree) <-
           first (modifyThunkPtrByConfig thunkConfig)
             <$> getThunkPtr checkClean thunkDir (_thunkConfig_private thunkConfig)
-        if isWorktree
-          then void $ do
-            -- Remove the branch locally, and then remove the worktree
-            case _gitSource_branch $ thunkSourceToGitSource $ _thunkPtr_source thunkPtr of
-              Just branch -> do
-                void $ readGitProcess thunkDir ["switch", "--detach"]
-                void $ readGitProcess thunkDir ["branch", "-d", T.unpack $ untagName branch]
-              Nothing -> pure () -- Should never happen
-            readGitProcess thunkDir ["worktree", "remove", "."]
-          else liftIO $ removePathForcibly thunkDir
-        createThunk thunkDir $ Right thunkPtr
+        -- Assemble the packed thunk beside the checkout and swap it in only once
+        -- it is complete. Generating the flake files reaches the network, and a
+        -- failure there must not leave the developer with neither their checkout
+        -- nor a readable thunk.
+        let (thunkParent, thunkName) = splitFileName thunkDir
+        withTempDirectory thunkParent thunkName $ \tmpThunk -> do
+          let staged = tmpThunk </> "packed"
+          createThunk staged $ Right thunkPtr
+          if isWorktree
+            then void $ do
+              -- Remove the branch locally, and then remove the worktree
+              case _gitSource_branch $ thunkSourceToGitSource $ _thunkPtr_source thunkPtr of
+                Just branch -> do
+                  void $ readGitProcess thunkDir ["switch", "--detach"]
+                  void $ readGitProcess thunkDir ["branch", "-d", T.unpack $ untagName branch]
+                Nothing -> pure () -- Should never happen
+              readGitProcess thunkDir ["worktree", "remove", "."]
+            else liftIO $ removePathForcibly thunkDir
+          liftIO $ renameDirectory staged thunkDir
         pure thunkPtr
 
 modifyThunkPtrByConfig :: ThunkConfig -> ThunkPtr -> ThunkPtr

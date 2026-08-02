@@ -24,6 +24,7 @@ module Nix.Thunk
   , unpackThunk
   , ThunkSpec (..)
   , ThunkFileSpec (..)
+  , ThunkGeneratedFile (..)
   , NixThunkError
   , nixBuildAttrWithCache
   , attrCacheFileName

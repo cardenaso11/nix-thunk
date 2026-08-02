@@ -35,7 +35,14 @@ rec {
         let
           packed = jsonFileName: {
             required = { ${jsonFileName} = "regular"; "default.nix" = "regular"; "thunk.nix" = "regular"; };
-            optional = { ".attr-cache" = "directory"; };
+            # flake.nix and flake.lock are present on thunks packed by newer
+            # versions of nix-thunk, which are also usable as flake inputs.
+            # They are optional so that older thunks still match.
+            optional = {
+              ".attr-cache" = "directory";
+              "flake.nix" = "regular";
+              "flake.lock" = "regular";
+            };
           };
         in builtins.any (n: contentsMatch (packed n)) [ "git.json" "github.json" ];
 

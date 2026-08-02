@@ -16,6 +16,54 @@ let
     let pkgs = import <nixpkgs> {}; in pkgs.git
   '';
 
+  # An upstream flake with a relative path input. It deliberately has no
+  # external inputs, so that locking it needs no network.
+  flakeSample = pkgs.writeText "flake.nix" ''
+    {
+      inputs.sub.url = "path:./sub";
+      outputs = { self, sub }: {
+        value = "upstream";
+        subValue = sub.value;
+      };
+    }
+  '';
+
+  flakeSubSample = pkgs.writeText "flake.nix" ''
+    { outputs = { self }: { value = "sub"; }; }
+  '';
+
+  # What the override test substitutes for the thunk's `sub` input.
+  flakeOverrideSample = pkgs.writeText "flake.nix" ''
+    { outputs = { self }: { value = "overridden"; }; }
+  '';
+
+  # Reads through the thunk: its outputs are forwarded, and `follows` reaches
+  # the inputs of the repository it points at.
+  consumerReadSample = pkgs.writeText "flake.nix" ''
+    {
+      inputs.mythunk.url = "path:/root/code/myflake";
+      inputs.readsSub.follows = "mythunk/sub";
+      outputs = { self, mythunk, readsSub }: {
+        forwarded = mythunk.value;
+        viaThunk = mythunk.subValue;
+        read = readsSub.value;
+      };
+    }
+  '';
+
+  # Overrides an input of the thunk, which must change what the thunk itself
+  # evaluates to.
+  consumerOverrideSample = pkgs.writeText "flake.nix" ''
+    {
+      inputs.mysub.url = "path:/root/code/mysub";
+      inputs.mythunk.url = "path:/root/code/myflake";
+      inputs.mythunk.inputs.sub.follows = "mysub";
+      outputs = { self, mythunk, mysub }: {
+        viaThunk = mythunk.subValue;
+      };
+    }
+  '';
+
   sshConfigFile = pkgs.writeText "ssh_config" ''
     Host *
       StrictHostKeyChecking no
@@ -44,6 +92,12 @@ in
         imports = [ (pkgs.path + /nixos/modules/installer/cd-dvd/channel.nix) ];
         nix.useSandbox = false;
         nix.binaryCaches = [];
+        # Needed by the tests that consume a packed thunk as a flake input.
+        # `nix-thunk` itself does not rely on this: it passes
+        # `--extra-experimental-features` on every command it runs.
+        nix.extraOptions = ''
+          experimental-features = nix-command flakes
+        '';
         environment.systemPackages = [
           pkgs.nix-prefetch-git
           pkgs.git
@@ -187,6 +241,98 @@ in
           nix-build ~/code/myapp-remote;
           nix-build ~/code/myapp-local;
           nix-thunk unpack ~/code/myapp-remote;
+        """)
+
+      with subtest("a thunk of a repo that is not a flake exposes its source"):
+        client.succeed("""
+          nix-thunk pack ~/code/myapp;
+          test -f ~/code/myapp/flake.nix;
+          test -f ~/code/myapp/flake.lock;
+          grep -qF 'inherit src' ~/code/myapp/flake.nix;
+          grep -qF 'flake = false' ~/code/myapp/flake.nix;
+          nix eval --raw "path:$HOME/code/myapp#src" >/dev/null;
+        """)
+
+      with subtest("unpacking keeps the flake interface of a non-flake thunk"):
+        client.succeed("""
+          nix-thunk unpack ~/code/myapp;
+          test -f ~/code/myapp/flake.nix;
+          nix eval --raw "path:$HOME/code/myapp#src" >/dev/null;
+
+          # The generated files must not read as work in progress, or packing
+          # would refuse to continue.
+          test -z "$(git -C ~/code/myapp status --porcelain)";
+
+          # Packing discards them and restores the fetching flake.
+          nix-thunk pack ~/code/myapp;
+          grep -qF 'inherit src' ~/code/myapp/flake.nix;
+          grep -qF 'flake = false' ~/code/myapp/flake.nix;
+          nix-thunk unpack ~/code/myapp;
+        """)
+
+      with subtest("a flake repo can be pushed to the remote"):
+        githost.succeed("""
+          mkdir -p ~/myorg/myflake.git;
+          cd ~/myorg/myflake.git && git init --bare
+        """)
+        client.succeed("""
+          mkdir -p ~/code/myflake-src/sub;
+          cd ~/code/myflake-src;
+          git init;
+          cp ${flakeSample} flake.nix;
+          cp ${flakeSubSample} sub/flake.nix;
+          git add .;
+          nix flake lock;
+          git add .;
+          git commit -m 'Initial';
+          git remote add origin root@githost:/root/myorg/myflake.git;
+          git push -u origin master;
+        """)
+
+      with subtest("a thunk of a flake repo is itself a flake"):
+        client.succeed("""
+          nix-thunk create -b master root@githost:/root/myorg/myflake.git ~/code/myflake;
+          test -f ~/code/myflake/flake.nix;
+          test -f ~/code/myflake/flake.lock;
+
+          # The flake pins the same revision as the thunk pointer.
+          rev=$(sed -n 's/.*"rev": "\\([0-9a-f]*\\)".*/\\1/p' ~/code/myflake/git.json | head -1);
+          test -n "$rev";
+          grep -qF "$rev" ~/code/myflake/flake.lock;
+
+          # Upstream's own input is exposed under upstream's own name.
+          grep -qF '"sub"' ~/code/myflake/flake.nix;
+        """)
+
+      with subtest("the packed thunk forwards outputs and follows can read its inputs"):
+        client.succeed("""
+          mkdir -p ~/code/consumer;
+          cp ${consumerReadSample} ~/code/consumer/flake.nix;
+          cd ~/code/consumer;
+          nix flake lock;
+          test "$(nix eval --raw .#forwarded)" = "upstream";
+          test "$(nix eval --raw .#viaThunk)" = "sub";
+          test "$(nix eval --raw .#read)" = "sub";
+        """)
+
+      with subtest("the thunk's inputs can be overridden"):
+        client.succeed("""
+          mkdir -p ~/code/mysub ~/code/consumer-override;
+          cp ${flakeOverrideSample} ~/code/mysub/flake.nix;
+          cp ${consumerOverrideSample} ~/code/consumer-override/flake.nix;
+          cd ~/code/consumer-override;
+          nix flake lock;
+          test "$(nix eval --raw .#viaThunk)" = "overridden";
+        """)
+
+      with subtest("packing a flake thunk is stable across a round trip"):
+        client.succeed("""
+          cp -r ~/code/myflake ~/code/myflake-before;
+          nix-thunk unpack ~/code/myflake;
+          nix-thunk pack ~/code/myflake;
+          diff -u ~/code/myflake-before/flake.nix ~/code/myflake/flake.nix;
+          diff -u ~/code/myflake-before/flake.lock ~/code/myflake/flake.lock;
+          diff -u ~/code/myflake-before/git.json ~/code/myflake/git.json;
         """)
 
       with subtest("nix-thunk can update from ssh remote"):

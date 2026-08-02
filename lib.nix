@@ -54,6 +54,9 @@ rec {
               pkgs.nix-prefetch-git
               pkgs.nix # For nix-prefetch-url
             ];
+            packages.nix-thunk.components.library.build-tools = [
+              pkgs.nix # For `nix flake lock` when packing a flake thunk
+            ];
             packages.nix-thunk.components.exes.nix-thunk = {
               enableStatic = true;
               postInstall = postInstallGenerateOptparseApplicativeCompletion "nix-thunk";

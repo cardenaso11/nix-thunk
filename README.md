@@ -190,6 +190,45 @@ read historical thunk formats, while newly written thunks use the latest format.
 This lets repositories update the tool independently from their existing
 dependency pointers.
 
+## Thunks as flake inputs
+
+A packed thunk is also a flake, so it can be used as an input directly:
+
+```nix
+inputs.mythunk.url = "path:./dep/mythunk";
+```
+
+The generated `flake.nix` forwards the outputs of the repository the thunk
+points at. It also exposes that repository's own inputs, under their own names
+and pinned to the revisions upstream locked, so `follows` works in both
+directions:
+
+```nix
+# Use whatever the thunk uses
+inputs.someinput.follows = "mythunk/nixpkgs";
+
+# Make the thunk use yours
+inputs.mythunk.inputs.nixpkgs.follows = "nixpkgs";
+```
+
+Two things are worth knowing. `mythunk.outPath` is the thunk directory rather
+than the fetched source, because Nix always takes a flake's `outPath` from its
+own source tree; use the named outputs instead. And an input that upstream
+declared as a relative path escaping its repository cannot be given a reference
+of its own, so it is exposed as an alias: readable, but not overridable.
+
+When the repository is not a flake at all, the generated flake has no inputs to
+expose and provides the fetched source as `src`.
+
+The flake interface survives `nix-thunk unpack`, so a project can keep building
+while a dependency is checked out for development. An unpacked thunk of a flake
+repository is that repository's own flake, which exposes the same outputs and
+the same input names. An unpacked thunk of a repository that is not a flake gets
+a generated `flake.nix` and `flake.lock` written into the checkout, providing
+the same `src` output; they are hidden through `.git/info/exclude` so the
+checkout still reads as clean, and packing removes them again. If you write your
+own `flake.nix` in an unpacked checkout, nix-thunk leaves it alone.
+
 ## Binary cache
 
 Builds from this repository are published to the Reflex binary cache. For a
