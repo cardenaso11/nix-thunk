@@ -50,9 +50,13 @@
   records every reference and hash it needs, rather than by running
   `nix flake lock` over inputs Nix would have to resolve one at a time. Packing
   a thunk of a repository with a large dependency graph no longer downloads
-  that graph, and no longer fails when one of its pins is unreachable. Nix is
-  still asked when an input could not be restated, which happens when upstream
-  declares one as a path outside its own repository.
+  that graph, and no longer fails when one of its pins is unreachable.
+
+  Nix is still asked when an input could not be restated, and then packing
+  costs what it always did. That happens when upstream declares an input as a
+  path outside its own repository, and when it gives one a name that Nix will
+  not accept in a `follows`: haskell.nix, for instance, has inputs called
+  things like `hls-1.10`, which a flake may declare but nothing may refer to.
 
 * The attribute cache moved out of the thunk directory, into
   `$XDG_CACHE_HOME/nix-thunk`. A packed thunk is now also read as a flake

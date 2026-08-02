@@ -741,26 +741,48 @@ writeThunkFlakeFiles target ptr = do
   fetched <- fetchFlakeRef srcRef
   let srcRefs = Flake.sourceNodeRefs srcRef $ _fetchedFlakeRef_locked fetched
   liftIO (doesFileExist $ _fetchedFlakeRef_outPath fetched </> flakeNixFileName) >>= \case
-    False -> liftIO $ do
-      writeUtf8File (target </> flakeNixFileName) $ Flake.renderSourceOnlyFlakeNix srcRef
-      LBS.writeFile (target </> flakeLockFileName) $ Flake.renderSourceOnlyFlakeLock srcRefs
+    False -> do
+      liftIO $ do
+        writeUtf8File (target </> flakeNixFileName) $ Flake.renderSourceOnlyFlakeNix srcRef
+        LBS.writeFile (target </> flakeLockFileName) $ Flake.renderSourceOnlyFlakeLock srcRefs
+      lockThunkFlake target
     True -> do
       lock <- upstreamFlakeLock $ _fetchedFlakeRef_outPath fetched
       let flattened = Flake.flattenLock srcRefs lock
       liftIO $ writeUtf8File (target </> flakeNixFileName) $ Flake.renderFlakeNix flattened
       -- Upstream's lock already answers what every input of the generated
       -- flake resolves to, so the thunk's own lock is written from it rather
-      -- than by asking Nix to resolve them all over again. Nix has to be asked
-      -- when the generated flake left something for upstream's lock to settle,
-      -- since then it is not this file that says what the inputs are.
+      -- than left for Nix to work out one input at a time. When the generated
+      -- flake left something for upstream's lock to settle, it is not this file
+      -- that says what the inputs are, and there is nothing to write.
       if Flake.flattenedFlake_complete flattened
         then liftIO $ LBS.writeFile (target </> flakeLockFileName) $ Flake.renderFlakeLock flattened
-        else do
+        else
           putLog Debug $
             "Some inputs of "
               <> T.pack target
               <> " could not be restated, so locking it has to resolve them."
-          nixFlakeLock target
+      lockThunkFlake target
+
+-- | Have Nix lock the generated flake.
+--
+-- With a lock beside it that already accounts for every input, this reads the
+-- two files, agrees, and writes nothing, which is the point: locking otherwise
+-- resolves an input per node of upstream's lock. It is run all the same,
+-- because it is the only thing that reads the generated flake back. A flake
+-- this rejects is one that would have been written and never evaluated until
+-- somebody depended on it.
+lockThunkFlake :: MonadNixThunk m => FilePath -> m ()
+lockThunkFlake target = do
+  before <- liftIO $ readFileMaybe $ target </> flakeLockFileName
+  nixFlakeLock target
+  after <- liftIO $ readFileMaybe $ target </> flakeLockFileName
+  when (isJust before && before /= after) $
+    putLog Warning $
+      "The lock written for "
+        <> T.pack target
+        <> " did not survive `nix flake lock`, which has replaced it. The thunk"
+        <> " is correct, but its inputs were resolved rather than restated."
 
 -- | The repository a reference points at, once fetched.
 data FetchedFlakeRef = FetchedFlakeRef

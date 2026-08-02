@@ -20,11 +20,15 @@ let
   # external inputs, so that locking it needs no network.
   # `subAlias` is a second root-level name for the same lock node, which is what
   # a root `follows` produces. Both names have to survive into the thunk.
+  #
+  # `sub-1.10` is a name Nix accepts here and rejects in a `follows`, as
+  # haskell.nix's `hls-1.10` is. It has to be exposed under a name that works.
   flakeSample = pkgs.writeText "flake.nix" ''
     {
       inputs.sub.url = "path:./sub";
       inputs.subAlias.follows = "sub";
-      outputs = { self, sub, subAlias }: {
+      inputs."sub-1.10".url = "path:./sub";
+      outputs = { self, sub, subAlias, ... }: {
         value = "upstream";
         subValue = sub.value;
       };
@@ -373,8 +377,12 @@ in
           grep -qF '"sub"' ~/code/myflake/flake.nix;
           grep -qF '"subAlias"' ~/code/myflake/flake.nix;
 
-          # The lock nix-thunk wrote is the one Nix would have written: it
-          # leaves the file alone rather than resolving the inputs again.
+          # A name Nix will not accept in a `follows` is exposed under one it
+          # will, and is never written into an override.
+          grep -qF '"sub-1_10"' ~/code/myflake/flake.nix;
+          test -z "$(grep -F '"sub-1.10"' ~/code/myflake/flake.nix)";
+
+          # Whatever wrote the lock, Nix has to agree with it as it stands.
           cp ~/code/myflake/flake.lock /tmp/myflake.lock.packed;
           (cd ~/code/myflake && nix flake lock);
           cmp ~/code/myflake/flake.lock /tmp/myflake.lock.packed;

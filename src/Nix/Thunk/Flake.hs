@@ -24,6 +24,7 @@ import Data.Aeson.Encode.Pretty (Config (confCompare, confIndent, confTrailingNe
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.Types qualified as Aeson
 import Data.ByteString.Lazy qualified as LBS
+import Data.Char (isAlpha, isAscii, isDigit)
 import Data.Either.Combinators (rightToMaybe)
 import Data.Foldable (fold, toList)
 import Data.Map (Map)
@@ -230,12 +231,24 @@ flattenLock srcRefs lock =
                 nonRootNodes lock
           )
           (aliasInput <$> rootAliases ctx)
-    , flattenedFlake_complete =
-        all nodeHasRef ctx.flattenContext_refs
-          && all (edgesAllResolve lock) (Map.keys lock.flakeLock_nodes)
+    , flattenedFlake_complete = all (edgesFullyDeclared ctx) $ Map.keys lock.flakeLock_nodes
     }
   where
     ctx = flattenContext srcRefs lock
+
+-- | Whether the generated flake declares every input a node of upstream's lock
+-- declares.
+--
+-- 'overridableEdges' drops an edge it cannot restate: one pointing at a node
+-- with no reference of its own, one whose @follows@ walks off the end of the
+-- graph, and one whose name Nix will not accept in an override. Whatever is
+-- dropped, Nix has to settle from upstream's own lock, and a lock that has to
+-- say what upstream's inputs are is not one this module can write.
+edgesFullyDeclared :: FlattenContext -> NodeId -> Bool
+edgesFullyDeclared ctx nodeId =
+  Map.size (overridableEdges ctx $ nodeEdgesOf lock nodeId) == Map.size (edgesOf lock nodeId)
+  where
+    lock = ctx.flattenContext_lock
 
 -- | A node given no reference of its own is one 'overridableEdges' leaves the
 -- edges to, so upstream's lock, not ours, is what says where it comes from.
@@ -246,25 +259,24 @@ nodeHasRef = \case
   Left _ -> False
   Right _ -> True
 
--- | Whether every edge of a node names something the lock actually contains. A
--- @follows@ that walks off the end of the graph is dropped rather than
--- reproduced, so a lock containing one cannot be restated in full.
-edgesAllResolve :: FlakeLock -> NodeId -> Bool
-edgesAllResolve lock nodeId =
-  Map.size (Map.mapMaybe (resolveEdge lock) edges) == Map.size edges
-  where
-    edges = edgesOf lock nodeId
-
 -- | The names upstream bound at its root that are not the name their node is
 -- exposed under, mapped to that name. Several of upstream's root inputs can
 -- resolve to one node, since a root-level @follows@ is just another name for
 -- what it points at, and only one of them can be the name the node itself is
 -- given. The rest are emitted as aliases, so that every name upstream used
 -- still resolves through the thunk.
+--
+-- Except the ones Nix cannot refer to at all: an alias exists to be followed,
+-- and a name that cannot appear in a @follows@ would only be dead weight.
 rootAliases :: FlattenContext -> Map InputName InputName
-rootAliases ctx = Map.filterWithKey isAlias $ inputNameOf ctx <$> rootEdges ctx.flattenContext_lock
-  where
-    isAlias edgeName exposedName = edgeName /= exposedName
+rootAliases ctx =
+  Map.fromList
+    [ (edgeName, exposed)
+    | (edgeName, target) <- Map.toList $ rootEdges ctx.flattenContext_lock
+    , isFlakeId edgeName
+    , let exposed = inputNameOf ctx target
+    , edgeName /= exposed
+    ]
 
 -- | An input that is nothing but a second name for a sibling input.
 aliasInput :: InputName -> FlattenedInput
@@ -275,16 +287,19 @@ aliasInput target =
     , flattenedInput_edges = Map.empty
     }
 
--- | An aliased node is bound with a @follows@ of its own, so overriding the
--- edge that reaches it would make the alias follow itself, which Nix rejects
--- as a follow cycle. Those edges are left alone for upstream's own lock to
--- resolve.
+-- | The edges of a node that the generated flake restates as a @follows@ onto
+-- one of its own inputs.
+--
+-- Two kinds are left alone for upstream's own lock to resolve. An aliased node
+-- is bound with a @follows@ of its own, so overriding the edge that reaches it
+-- would make the alias follow itself, which Nix rejects as a follow cycle. And
+-- an edge whose name is not a flake identifier cannot be overridden at all,
+-- since the override is written as an attribute path.
 overridableEdges :: FlattenContext -> Map InputName NodeId -> Map InputName InputName
-overridableEdges ctx = fmap (inputNameOf ctx) . Map.filter overridable
+overridableEdges ctx = fmap (inputNameOf ctx) . Map.filterWithKey overridable
   where
-    overridable target = case Map.lookup target ctx.flattenContext_refs of
-      Just (Right _) -> True
-      _ -> False
+    overridable edgeName target =
+      isFlakeId edgeName && maybe False nodeHasRef (Map.lookup target ctx.flattenContext_refs)
 
 inputNameOf :: FlattenContext -> NodeId -> InputName
 inputNameOf ctx nodeId =
@@ -298,30 +313,67 @@ inputNameOf ctx nodeId =
 -- plain key. Exposing node ids would therefore bind @mythunk\/nixpkgs@ to the
 -- wrong flake, and would retarget it whenever upstream's input set changes.
 -- Upstream's root inputs are named as upstream named them; anything reachable
--- only transitively keeps its node id, with collisions suffixed.
+-- only transitively keeps its node id, with collisions suffixed. Either way the
+-- name has to be one Nix can refer to, so 'toFlakeId' has the last word.
 nodeInputNames :: FlakeLock -> Map NodeId InputName
-nodeInputNames lock = foldl' nameNode (firstRootNames lock) $ Map.keys $ nonRootNodes lock
+nodeInputNames lock = foldl' nameTransitive (rootInputNames lock) $ Map.keys $ nonRootNodes lock
   where
     -- Every name upstream bound at its root is reserved, including the ones
-    -- 'firstRootNames' had to drop: 'rootAliases' will claim those, and a
+    -- 'rootInputNames' had to drop: 'rootAliases' will claim those, and a
     -- transitive node must not be given a name an alias is about to take.
-    reserved = Map.keysSet $ rootEdges lock
-    nameNode acc nodeId
+    reserved = Set.fromList $ toFlakeId <$> Map.keys (rootEdges lock)
+    nameTransitive acc nodeId
       | Map.member nodeId acc = acc
       | otherwise =
           Map.insert
             nodeId
-            (freshInputName (reserved <> Set.fromList (toList acc)) $ nodeIdToInputName nodeId)
+            (freshInputName (reserved <> Set.fromList (toList acc)) $ toFlakeId $ nodeIdToInputName nodeId)
             acc
 
 -- | The name each node upstream binds at its root is exposed under. A node
 -- bound more than once, which a root-level @follows@ does, keeps the first of
 -- those names.
-firstRootNames :: FlakeLock -> Map NodeId InputName
-firstRootNames lock =
-  Map.fromListWith
-    (\_ firstSeen -> firstSeen)
-    [(target, edgeName) | (edgeName, target) <- Map.toList $ rootEdges lock]
+rootInputNames :: FlakeLock -> Map NodeId InputName
+rootInputNames lock = foldl' nameFromRoot Map.empty $ Map.toList $ rootEdges lock
+  where
+    nameFromRoot acc (edgeName, target)
+      | Map.member target acc = acc
+      | otherwise =
+          Map.insert
+            target
+            (freshInputName (Set.fromList $ toList acc) $ toFlakeId edgeName)
+            acc
+
+-- | Whether Nix will accept a name where it parses one: both a @follows@ and
+-- the attribute path of an override are read as flake identifiers.
+--
+-- Declaring an input is not one of those places, so upstream can and does have
+-- inputs named things a consumer cannot refer to: haskell.nix has fourteen,
+-- including @hls-1.10@.
+isFlakeId :: InputName -> Bool
+isFlakeId name = case T.uncons $ unInputName name of
+  Just (leading, rest) -> isFlakeIdStart leading && T.all isFlakeIdChar rest
+  Nothing -> False
+
+-- | The name to expose an input under, given the name upstream used for it.
+--
+-- Upstream's own name whenever Nix can refer to it, and the nearest thing to it
+-- otherwise. These names exist to be followed, so a name that cannot appear in
+-- a @follows@ is no use as one, however faithful.
+toFlakeId :: InputName -> InputName
+toFlakeId name
+  | isFlakeId name = name
+  | otherwise = InputName $ leadingLetter <> T.map keepOrReplace text
+  where
+    text = unInputName name
+    leadingLetter = if maybe False (isFlakeIdStart . fst) (T.uncons text) then "" else "input-"
+    keepOrReplace c = if isFlakeIdChar c then c else '_'
+
+isFlakeIdStart :: Char -> Bool
+isFlakeIdStart c = isAscii c && isAlpha c
+
+isFlakeIdChar :: Char -> Bool
+isFlakeIdChar c = isFlakeIdStart c || (isAscii c && isDigit c) || c == '_' || c == '-'
 
 freshInputName :: Set InputName -> InputName -> InputName
 freshInputName taken base = go (0 :: Int)
@@ -698,7 +750,7 @@ flattenedInput ctx nodeId node =
   FlattenedInput
     { flattenedInput_ref = fromMaybe (Left $ aliasPath ctx nodeId) $ Map.lookup nodeId ctx.flattenContext_refs
     , flattenedInput_isFlake = node.flakeNode_isFlake
-    , flattenedInput_edges = overridableEdges ctx $ nodeEdges ctx.flattenContext_lock node
+    , flattenedInput_edges = overridableEdges ctx $ nodeEdgesOf ctx.flattenContext_lock nodeId
     }
 
 -- | The references the thunk should bind a single node to.
@@ -759,8 +811,8 @@ aliasPath ctx nodeId =
 rootEdges :: FlakeLock -> Map InputName NodeId
 rootEdges lock = Map.mapMaybe (resolveEdge lock) $ edgesOf lock lock.flakeLock_root
 
-nodeEdges :: FlakeLock -> FlakeNode -> Map InputName NodeId
-nodeEdges lock node = Map.mapMaybe (resolveEdge lock) node.flakeNode_inputs
+nodeEdgesOf :: FlakeLock -> NodeId -> Map InputName NodeId
+nodeEdgesOf lock nodeId = Map.mapMaybe (resolveEdge lock) $ edgesOf lock nodeId
 
 nonRootNodes :: FlakeLock -> Map NodeId FlakeNode
 nonRootNodes lock = Map.delete lock.flakeLock_root lock.flakeLock_nodes
@@ -774,7 +826,8 @@ sourceInputName taken = freshInputName taken $ InputName "upstream"
 -- | Every root-level name the generated flake binds for upstream: the name
 -- each node is exposed under, plus the alias names upstream also used.
 takenInputNames :: FlakeLock -> Map NodeId InputName -> Set InputName
-takenInputNames lock names = Map.keysSet (rootEdges lock) <> Set.fromList (toList names)
+takenInputNames lock names =
+  Set.fromList (toFlakeId <$> Map.keys (rootEdges lock)) <> Set.fromList (toList names)
 
 -- | Where each node of upstream's lock was first reached from.
 --

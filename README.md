@@ -221,11 +221,18 @@ When the repository is not a flake at all, the generated flake has no inputs to
 expose and provides the fetched source as `src`. `src` is a fetched tree rather
 than a bare path, so `src.outPath` and `src.narHash` are both there.
 
-The `flake.lock` beside it is written from upstream's own lock rather than by
-running `nix flake lock`, so packing does not fetch the repositories upstream
-depends on and does not fail when one of them is unreachable. The result is the
-lock Nix would have written: running `nix flake lock` on a packed thunk leaves
-it alone.
+The `flake.lock` beside it is usually written from upstream's own lock rather
+than by running `nix flake lock`, so packing does not fetch the repositories
+upstream depends on and does not fail when one of them is unreachable. The
+result is the lock Nix would have written: running `nix flake lock` on a packed
+thunk leaves it alone. Where an input cannot be restated, Nix is asked to
+resolve it after all, and packing costs what it always did.
+
+An input can fail to be restated in two ways: upstream declared it as a path
+outside its own repository, or upstream gave it a name Nix will not accept in a
+`follows`. A flake may declare an input called `hls-1.10`, as haskell.nix does,
+but nothing may refer to one, so such an input is exposed under the nearest
+name that works (`hls-1_10`) and is left for upstream's own lock to resolve.
 
 If you do not want any of this, `create`, `pack` and `update` take `--no-flake`
 and write the newest format that carries no flake files. The format belongs to
