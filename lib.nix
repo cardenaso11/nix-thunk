@@ -45,6 +45,8 @@ rec {
         compiler-nix-name = ghc;
         modules = [
           ({...}: {
+            # Turns on -Werror and friends; see the `strict` flag in nix-thunk.cabal
+            packages.nix-thunk.flags.strict = true;
             packages.cli-git.components.library.build-tools = [
               pkgs.git
             ];

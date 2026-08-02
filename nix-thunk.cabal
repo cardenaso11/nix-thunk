@@ -1,7 +1,7 @@
-cabal-version:      >=1.10
+cabal-version:      3.12
 name:               nix-thunk
 version:            0.7.3.0
-license:            BSD3
+license:            BSD-3-Clause
 license-file:       LICENSE
 copyright:          Obsidian Systems LLC 2020-2022
 maintainer:         maintainer@obsidian.systems
@@ -19,21 +19,142 @@ extra-source-files:
   CHANGELOG.md
   README.md
 
-tested-with: GHC ==8.6.5 || ==8.8.4 || ==8.10.7 || ==9.0.1 || ==9.2.5 || ==9.4.5 || ==9.6.1 || ==9.8.2 || ==9.10.1 || ==9.12.2
+tested-with: GHC >=9.12
+
+flag strict
+  description: Build with options, such as -Werror, which are inconvenient for development but good for CI
+  default: False
+  manual: True
+
+common common
+  default-language: GHC2024
+
+  default-extensions:
+      AllowAmbiguousTypes
+    , ApplicativeDo
+    , Arrows
+    , BangPatterns
+    , BinaryLiterals
+    , BlockArguments
+    , ConstrainedClassMethods
+    , ConstraintKinds
+    , DataKinds
+    , DefaultSignatures
+    , DeriveDataTypeable
+    , DeriveFoldable
+    , DeriveFunctor
+    , DeriveGeneric
+    , DeriveLift
+    , DeriveTraversable
+    , DerivingStrategies
+    , DerivingVia
+    , DisambiguateRecordFields
+    , DoAndIfThenElse
+    , DuplicateRecordFields
+    , EmptyCase
+    , EmptyDataDecls
+    , EmptyDataDeriving
+    , ExistentialQuantification
+    , ExplicitForAll
+    , ExplicitNamespaces
+    , ExtendedDefaultRules
+    , FlexibleContexts
+    , FlexibleInstances
+    , FunctionalDependencies
+    , GADTs
+    , GeneralizedNewtypeDeriving
+    , HexFloatLiterals
+    , ImportQualifiedPost
+    , ImpredicativeTypes
+    , InstanceSigs
+    , KindSignatures
+    , LambdaCase
+    , LexicalNegation
+    , LiberalTypeSynonyms
+    , MonadComprehensions
+    , MultilineStrings
+    , MultiParamTypeClasses
+    , MultiWayIf
+    , NamedDefaults
+    , NegativeLiterals
+    , NoDeriveAnyClass
+    , NoNamedFieldPuns
+    , NoRecordWildCards
+    , NumericUnderscores
+    , OrPatterns
+    , OverloadedLabels
+    , OverloadedLists
+    , OverloadedRecordDot
+    , OverloadedStrings
+    , PackageImports
+    , ParallelListComp
+    , PartialTypeSignatures
+    , PatternGuards
+    , PatternSynonyms
+    , PolyKinds
+    , PostfixOperators
+    , QualifiedDo
+    , QuantifiedConstraints
+    , QuasiQuotes
+    , RankNTypes
+    , RecursiveDo
+    , RequiredTypeArguments
+    , RoleAnnotations
+    , ScopedTypeVariables
+    , StandaloneDeriving
+    , StandaloneKindSignatures
+    , TemplateHaskell
+    , TemplateHaskellQuotes
+    , TransformListComp
+    , TupleSections
+    , TypeApplications
+    , TypeData
+    , TypeFamilies
+    , TypeFamilyDependencies
+    , TypeOperators
+    , TypeSynonymInstances
+    , UndecidableInstances
+    , UnicodeSyntax
+    , ViewPatterns
+
+  if flag(strict)
+    ghc-options:  -Werror
+                  -Wunused-packages
+
+  ghc-options:    -O2
+
+  ghc-options:    -Wall
+                  -Wno-type-defaults
+                  -Wno-partial-type-signatures
+                  -Wincomplete-record-updates -Werror=incomplete-record-updates
+                  -Wincomplete-patterns -Werror=incomplete-patterns
+                  -Wincomplete-uni-patterns -Werror=incomplete-uni-patterns
+                  -Wpartial-fields -Werror=partial-fields
+                  -Wmissing-fields -Werror=missing-fields
+                  -Widentities
+                  -Wredundant-constraints
+                  -Wunused-packages
+
+  if impl(ghc >= 8.8)
+    ghc-options:
+                  -Wmissing-deriving-strategies
+                  -Werror=missing-deriving-strategies
+
+  if !(arch(wasm32))
+    ghc-options:  -threaded -rtsopts -with-rtsopts=-N
 
 library
+  import:           common
   exposed-modules:
     Nix.Thunk
     Nix.Thunk.Internal
     Nix.Thunk.Command
 
   hs-source-dirs:   src
-  default-language: Haskell2010
-  ghc-options:      -Wall
   build-depends:
       aeson                 >=1.4.4.0  && <2.3
     , aeson-pretty          >=0.8.7    && <0.9
-    , base                  >=4.12.0.0 && <4.22
+    , base                  >=4.21.0.0 && <4.22
     , bytestring            >=0.10.8.2 && <0.13
     , cli-extras            >=0.2.1.0  && <0.3
     , cli-git               >=0.2.0.0  && <0.3
@@ -50,29 +171,25 @@ library
     , here                  >=1.2.13   && <1.3
     , lens                  >=4.17.1   && <5.4
     , logging-effect        >=1.3.4    && <1.5
-    , megaparsec            >=7.0.5    && <9.8
     , memory                >=0.14     && <0.19
     , modern-uri            >=0.3.1.0  && <0.4
-    , monad-logger          >=0.3.30   && <0.4
     , mtl                   >=2.2.2    && <2.4
     , optparse-applicative  >=0.14.3.0 && <0.20
     , temporary             >=1.3      && <1.4
     , text                  >=1.2.3.1  && <2.2
     , time                  >=1.8.0.2  && <1.15
     , unix                  >=2.7.2.2  && <2.9
-    , which                 >=0.2      && <0.3
     , yaml                  >=0.11.1.2 && <0.12
 
 executable nix-thunk
+  import:           common
   main-is:          src-bin/nix-thunk.hs
   other-modules:    Paths_nix_thunk
-  default-language: Haskell2010
   build-depends:
       base
     , cli-extras
     , nix-thunk
     , optparse-applicative
-    , text
 
 source-repository head
   type:     git
