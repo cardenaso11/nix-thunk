@@ -149,6 +149,12 @@ library
     Nix.Thunk
     Nix.Thunk.Internal
     Nix.Thunk.Flake
+    Nix.Thunk.Flake.Flatten
+    Nix.Thunk.Flake.Lockfile
+    Nix.Thunk.Flake.Name
+    Nix.Thunk.Flake.Ref
+    Nix.Thunk.Flake.Render
+    Nix.Thunk.Flake.Upstream
     Nix.Thunk.Command
 
   hs-source-dirs:   src
