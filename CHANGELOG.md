@@ -36,6 +36,13 @@
   which reject any file they do not recognise. Projects pinning an older
   nix-thunk for their Nix code need to update it before updating their thunks.
 
+* The attribute cache moved out of the thunk directory, into
+  `$XDG_CACHE_HOME/nix-thunk`. A packed thunk is now also read as a flake
+  input, so everything inside it is hashed into a consumer's `flake.lock`, and
+  building an attribute of a thunk would otherwise have changed the thunk. A
+  leftover `.attr-cache` directory is still accepted, so existing thunks keep
+  reading; nothing writes to it any more, and it can be deleted.
+
 * Drop GHC older than 9.12. `Nix.Thunk.Flake` uses `MultilineStrings`, which
   requires 9.12. Also bumps the `haskell.nix` pin.
 

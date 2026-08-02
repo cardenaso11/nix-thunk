@@ -24,7 +24,7 @@ import Control.Monad.Except
 import Control.Monad.Extra (findM)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.Log (MonadLog)
-import Crypto.Hash (Digest, HashAlgorithm, SHA1, digestFromByteString)
+import Crypto.Hash (Digest, HashAlgorithm, SHA1 (SHA1), digestFromByteString, hashWith)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Encode.Pretty
@@ -367,6 +367,10 @@ didMatchThunkSpec _ = False
 unpackedDirName :: FilePath
 unpackedDirName = "."
 
+-- | Where thunks used to keep their attribute cache. Nothing writes here any
+-- more, since a packed thunk is also a flake input and its contents are hashed
+-- (see 'attrCacheDir'), but every spec still allows the directory so that a
+-- thunk left over from an older version keeps reading as a thunk.
 attrCacheFileName :: FilePath
 attrCacheFileName = ".attr-cache"
 
@@ -1363,41 +1367,56 @@ nixBuildThunkAttrWithCache thunkSpec thunkDir attr = do
         thunkFileNames = L.delete attrCacheFileName $ Map.keys $ _thunkSpec_files thunkSpec
     maximumMaybe . catMaybes <$> traverse (getModificationTimeMaybe . (thunkDir </>)) thunkFileNames
 
-  let cachePaths' =
-        nonEmpty $
-          Map.keys $
-            Map.filter (\case ThunkFileSpec_AttrCache -> True; _ -> False) $
-              _thunkSpec_files thunkSpec
-  for cachePaths' $ \cachePaths ->
-    fmap NonEmpty.head $ for cachePaths $ \cacheDir -> do
-      let cachePath = thunkDir </> cacheDir </> attr <.> "out"
-          cacheErrHandler e
-            | isDoesNotExistError e = pure Nothing -- expected from a cache miss
-            | otherwise = Nothing <$ putLog Error (T.pack $ displayException e)
-      cacheHit <- handle cacheErrHandler $ do
-        cacheTime <- liftIO $ posixSecondsToUTCTime . realToFrac . modificationTime <$> getSymbolicLinkStatus cachePath
-        pure $
-          -- No readable modification time for any thunk file means we cannot
-          -- show the cache is current, so treat it as a miss and rebuild.
-          if maybe False (<= cacheTime) latestChange
-            then Just cachePath
-            else Nothing
-      case cacheHit of
-        Just c -> pure c
-        Nothing -> do
-          putLog Warning $ T.pack $ mconcat [thunkDir, ": ", attr, " not cached, building ..."]
-          liftIO $ createDirectoryIfMissing True (takeDirectory cachePath)
-          let buildTarget =
-                Target
-                  { _target_path = Just thunkDir
-                  , _target_attr = Just attr
-                  , _target_expr = Nothing
-                  }
-              buildCfg =
-                def
-                  & nixBuildConfig_outLink .~ OutLink_IndirectRoot cachePath
-                  & nixCmdConfig_target .~ buildTarget
-          cachePath <$ nixCmd (NixCmd_Build buildCfg)
+  let cachesAttrs = any isAttrCache $ _thunkSpec_files thunkSpec
+      isAttrCache = \case ThunkFileSpec_AttrCache -> True; _ -> False
+  for (guard cachesAttrs) $ \() -> do
+    cachePath <- liftIO $ (</> attr <.> "out") <$> attrCacheDir thunkDir
+    let cacheErrHandler e
+          | isDoesNotExistError e = pure Nothing -- expected from a cache miss
+          | otherwise = Nothing <$ putLog Error (T.pack $ displayException e)
+    cacheHit <- handle cacheErrHandler $ do
+      cacheTime <- liftIO $ posixSecondsToUTCTime . realToFrac . modificationTime <$> getSymbolicLinkStatus cachePath
+      pure $
+        -- No readable modification time for any thunk file means we cannot
+        -- show the cache is current, so treat it as a miss and rebuild.
+        if maybe False (<= cacheTime) latestChange
+          then Just cachePath
+          else Nothing
+    case cacheHit of
+      Just c -> pure c
+      Nothing -> do
+        putLog Warning $ T.pack $ mconcat [thunkDir, ": ", attr, " not cached, building ..."]
+        liftIO $ createDirectoryIfMissing True (takeDirectory cachePath)
+        let buildTarget =
+              Target
+                { _target_path = Just thunkDir
+                , _target_attr = Just attr
+                , _target_expr = Nothing
+                }
+            buildCfg =
+              def
+                & nixBuildConfig_outLink .~ OutLink_IndirectRoot cachePath
+                & nixCmdConfig_target .~ buildTarget
+        cachePath <$ nixCmd (NixCmd_Build buildCfg)
+
+-- | Where the results of 'nixBuildThunkAttrWithCache' are kept.
+--
+-- Outside the thunk directory, even though 'attrCacheFileName' still names a
+-- directory inside it: a packed thunk is now also consumed as a @path:@ flake
+-- input, so everything inside it is copied into the store and covered by the
+-- narHash a consumer's @flake.lock@ records. Caching in there would mean that
+-- building an attribute of a thunk changed the thunk, and that two developers
+-- computed different hashes for the same commit. The links are indirect GC
+-- roots, so they keep their targets alive from anywhere.
+attrCacheDir :: FilePath -> IO FilePath
+attrCacheDir thunkDir = do
+  cacheRoot <- getXdgDirectory XdgCache "nix-thunk"
+  key <- attrCacheKey <$> canonicalizePath thunkDir
+  pure $ cacheRoot </> "attrs" </> key
+
+-- | A thunk's location, reduced to something usable as a directory name.
+attrCacheKey :: FilePath -> FilePath
+attrCacheKey = show . hashWith SHA1 . encodeUtf8 . T.pack
 
 -- | Build a nix attribute, and cache the result if possible
 nixBuildAttrWithCache
