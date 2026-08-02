@@ -1,30 +1,22 @@
 {
   inputs = {
-    # dep/style.hs is a git submodule; this makes nix fetch it automatically
-    # when the flake is fetched over git (Nix 2.27+; on older Nix, add
-    # ?submodules=1 to the flake URL).
     self.submodules = true;
 
-    # Everything else nix-thunk depends on is a nix-thunk under dep/, and a
-    # packed thunk is itself a flake, so it is an input like any other.
     haskell-nix.url = ./dep/haskell.nix;
 
-    # Whatever haskell.nix builds against, so that only one nixpkgs is in play.
-    # This resolves through the thunk, which exposes upstream's inputs under
-    # upstream's own names.
     nixpkgs.follows = "haskell-nix/nixpkgs";
   };
 
   outputs = inputs@{ self, ... }:
-    let inherit (inputs) nixpkgs;
+    let nixpkgs = if inputs ? "nixpkgs" then inputs.nixpkgs else builtins.getFlake "nixpkgs";
         eachSystem = nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed;
 
-        # `default.nix` is the stable entry point and takes no `system`, so the
-        # flake hands it a package set built for one. It works the rest out for
-        # itself, including `gitignoreSource` from dep/gitignore.nix.
-        nixThunkFor = system: import ./default.nix {
-          pkgs = inputs.haskell-nix.legacyPackages.${system};
-        };
+        # The entry points below take no `system`, since they are meant to work
+        # outside a flake too, so the flake hands each one a package set built
+        # for one. They work the rest out for themselves, including
+        # `gitignoreSource` from dep/gitignore.nix.
+        pkgsFor = system: inputs.haskell-nix.legacyPackages.${system};
+        nixThunkFor = system: import ./default.nix { pkgs = pkgsFor system; };
     in {
       lib = eachSystem (system:
         let nix-thunk = nixThunkFor system;
@@ -40,6 +32,10 @@
           default = nix-thunk;
         }
       );
+
+      devShells = eachSystem (system: {
+        default = import ./shell.nix { pkgs = pkgsFor system; };
+      });
     };
 
   nixConfig = {
