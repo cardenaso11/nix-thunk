@@ -20,7 +20,10 @@ module Nix.Thunk.Flake where
 
 import Control.Monad (foldM, guard)
 import Data.Aeson qualified as Aeson
+import Data.Aeson.Encode.Pretty (Config (confCompare, confIndent, confTrailingNewline), Indent (Spaces), defConfig, encodePretty')
+import Data.Aeson.Key qualified as Key
 import Data.Aeson.Types qualified as Aeson
+import Data.ByteString.Lazy qualified as LBS
 import Data.Either.Combinators (rightToMaybe)
 import Data.Foldable (fold, toList)
 import Data.Map (Map)
@@ -38,15 +41,20 @@ import System.FilePath (isAbsolute, joinPath, splitDirectories, (</>))
 
 data FlattenedFlake = FlattenedFlake
   { flattenedFlake_sourceName :: InputName
-  , flattenedFlake_sourceRef :: FlakeRef
+  , flattenedFlake_sourceRefs :: NodeRefs
   , flattenedFlake_sourceEdges :: Map InputName InputName
   , flattenedFlake_inputs :: Map InputName FlattenedInput
+  , flattenedFlake_complete :: Bool
+  -- ^ Whether every node of upstream's lock became an input with a reference
+  -- of its own and every edge was reproduced. Only then does this flake say
+  -- everything about its own inputs, and only then can 'renderFlakeLock'
+  -- describe it without asking Nix.
   }
   deriving stock (Eq, Show)
 
 -- | One root-level input of the generated flake.
 data FlattenedInput = FlattenedInput
-  { flattenedInput_ref :: Either FollowsPath FlakeRef
+  { flattenedInput_ref :: Either FollowsPath NodeRefs
   -- ^ 'Left' is used when the node cannot be expressed as a fetchable
   -- reference. Such an input is readable but not overridable.
   , flattenedInput_isFlake :: Bool
@@ -59,23 +67,59 @@ data FlattenedInput = FlattenedInput
 -- resolved against a parent whose own reference may itself have been rewritten.
 data FlattenContext = FlattenContext
   { flattenContext_sourceName :: InputName
-  , flattenContext_sourceRef :: FlakeRef
+  , flattenContext_sourceRefs :: NodeRefs
   , flattenContext_lock :: FlakeLock
   , flattenContext_origins :: Map NodeId NodeOrigin
-  , flattenContext_refs :: Map NodeId (Either FollowsPath FlakeRef)
+  , flattenContext_refs :: Map NodeId (Either FollowsPath NodeRefs)
   , flattenContext_names :: Map NodeId InputName
   }
+
+-- | The two references a lock records for one input: the one the flake
+-- declares, and the one it resolves to.
+--
+-- They differ only in the attributes a fetch discovers, which is why the
+-- locked one is copied out of upstream's own lock rather than computed: that
+-- is what lets a thunk be locked without fetching anything.
+data NodeRefs = NodeRefs
+  { nodeRefs_original :: FlakeRef
+  , nodeRefs_locked :: FlakeRef
+  }
+  deriving stock (Eq, Show)
+
+-- | One node of a @flake.lock@.
+data LockNode = LockNode
+  { lockNode_edges :: Map InputName LockEdge
+  , lockNode_refs :: Maybe NodeRefs
+  -- ^ 'Nothing' for the root node, which is the flake being locked.
+  , lockNode_isFlake :: Bool
+  }
+  deriving stock (Eq, Show)
+
+-- | An edge of a @flake.lock@: a node id, or a path walked from the root.
+data LockEdge
+  = LockEdge_Node InputName
+  | LockEdge_Follows FollowsPath
+  deriving stock (Eq, Show)
 
 -- | How a node was first reached from upstream's root. This is what lets a
 -- relative path input be resolved against its parent, and what an unresolvable
 -- one falls back to aliasing.
 data NodeOrigin = NodeOrigin
-  { nodeOrigin_parent :: Maybe NodeId
-  -- ^ 'Nothing' when the node hangs directly off upstream's root, in which
-  -- case its parent is the thunk's own source.
+  { nodeOrigin_declaredIn :: Maybe DeclarationSite
+  -- ^ 'Nothing' when the node was only ever reached across a @follows@, which
+  -- says nothing about where the node came from.
   , nodeOrigin_path :: [InputName]
   -- ^ Edge names from upstream's root down to this node.
   }
+  deriving stock (Eq, Show)
+
+-- | The flake a node was declared by, which is the flake a relative path it
+-- was declared with is relative to.
+data DeclarationSite
+  = -- | The repository the thunk points at: the node hangs off upstream's root.
+    DeclarationSite_Source
+  | -- | Another node of upstream's lock.
+    DeclarationSite_Node NodeId
   deriving stock (Eq, Show)
 
 data FlakeLock = FlakeLock
@@ -169,23 +213,67 @@ newtype InputName = InputName {unInputName :: Text}
 
 -- | Flatten upstream's lock graph into the inputs of the thunk's own flake.
 flattenLock
-  :: FlakeRef
+  :: NodeRefs
   -- ^ Reference to the repository the thunk points at
   -> FlakeLock
   -- ^ Upstream's @flake.lock@
   -> FlattenedFlake
-flattenLock srcRef lock =
+flattenLock srcRefs lock =
   FlattenedFlake
     { flattenedFlake_sourceName = ctx.flattenContext_sourceName
-    , flattenedFlake_sourceRef = ctx.flattenContext_sourceRef
+    , flattenedFlake_sourceRefs = ctx.flattenContext_sourceRefs
     , flattenedFlake_sourceEdges = overridableEdges ctx $ rootEdges lock
     , flattenedFlake_inputs =
-        Map.mapKeys (inputNameOf ctx) $
-          Map.mapWithKey (flattenedInput ctx) $
-            nonRootNodes lock
+        Map.union
+          ( Map.mapKeys (inputNameOf ctx) $
+              Map.mapWithKey (flattenedInput ctx) $
+                nonRootNodes lock
+          )
+          (aliasInput <$> rootAliases ctx)
+    , flattenedFlake_complete =
+        all nodeHasRef ctx.flattenContext_refs
+          && all (edgesAllResolve lock) (Map.keys lock.flakeLock_nodes)
     }
   where
-    ctx = flattenContext srcRef lock
+    ctx = flattenContext srcRefs lock
+
+-- | A node given no reference of its own is one 'overridableEdges' leaves the
+-- edges to, so upstream's lock, not ours, is what says where it comes from.
+-- The aliases 'rootAliases' adds are not these: they are extra names for a
+-- node that does have one.
+nodeHasRef :: Either FollowsPath NodeRefs -> Bool
+nodeHasRef = \case
+  Left _ -> False
+  Right _ -> True
+
+-- | Whether every edge of a node names something the lock actually contains. A
+-- @follows@ that walks off the end of the graph is dropped rather than
+-- reproduced, so a lock containing one cannot be restated in full.
+edgesAllResolve :: FlakeLock -> NodeId -> Bool
+edgesAllResolve lock nodeId =
+  Map.size (Map.mapMaybe (resolveEdge lock) edges) == Map.size edges
+  where
+    edges = edgesOf lock nodeId
+
+-- | The names upstream bound at its root that are not the name their node is
+-- exposed under, mapped to that name. Several of upstream's root inputs can
+-- resolve to one node, since a root-level @follows@ is just another name for
+-- what it points at, and only one of them can be the name the node itself is
+-- given. The rest are emitted as aliases, so that every name upstream used
+-- still resolves through the thunk.
+rootAliases :: FlattenContext -> Map InputName InputName
+rootAliases ctx = Map.filterWithKey isAlias $ inputNameOf ctx <$> rootEdges ctx.flattenContext_lock
+  where
+    isAlias edgeName exposedName = edgeName /= exposedName
+
+-- | An input that is nothing but a second name for a sibling input.
+aliasInput :: InputName -> FlattenedInput
+aliasInput target =
+  FlattenedInput
+    { flattenedInput_ref = Left $ FollowsPath [target]
+    , flattenedInput_isFlake = True
+    , flattenedInput_edges = Map.empty
+    }
 
 -- | An aliased node is bound with a @follows@ of its own, so overriding the
 -- edge that reaches it would make the alias follow itself, which Nix rejects
@@ -212,19 +300,28 @@ inputNameOf ctx nodeId =
 -- Upstream's root inputs are named as upstream named them; anything reachable
 -- only transitively keeps its node id, with collisions suffixed.
 nodeInputNames :: FlakeLock -> Map NodeId InputName
-nodeInputNames lock = foldl' name fromRoot $ Map.keys $ nonRootNodes lock
+nodeInputNames lock = foldl' nameNode (firstRootNames lock) $ Map.keys $ nonRootNodes lock
   where
-    fromRoot =
-      Map.fromListWith
-        (\_ firstSeen -> firstSeen)
-        [(target, edgeName) | (edgeName, target) <- Map.toList $ rootEdges lock]
-    name acc nodeId
+    -- Every name upstream bound at its root is reserved, including the ones
+    -- 'firstRootNames' had to drop: 'rootAliases' will claim those, and a
+    -- transitive node must not be given a name an alias is about to take.
+    reserved = Map.keysSet $ rootEdges lock
+    nameNode acc nodeId
       | Map.member nodeId acc = acc
       | otherwise =
           Map.insert
             nodeId
-            (freshInputName (Set.fromList $ Map.elems acc) $ nodeIdToInputName nodeId)
+            (freshInputName (reserved <> Set.fromList (toList acc)) $ nodeIdToInputName nodeId)
             acc
+
+-- | The name each node upstream binds at its root is exposed under. A node
+-- bound more than once, which a root-level @follows@ does, keeps the first of
+-- those names.
+firstRootNames :: FlakeLock -> Map NodeId InputName
+firstRootNames lock =
+  Map.fromListWith
+    (\_ firstSeen -> firstSeen)
+    [(target, edgeName) | (edgeName, target) <- Map.toList $ rootEdges lock]
 
 freshInputName :: Set InputName -> InputName -> InputName
 freshInputName taken base = go (0 :: Int)
@@ -253,7 +350,7 @@ renderFlakeNix flake =
         ]
       , renderRefEntry
           flake.flattenedFlake_sourceName
-          flake.flattenedFlake_sourceRef
+          flake.flattenedFlake_sourceRefs.nodeRefs_original
           flake.flattenedFlake_sourceEdges
       , fold $ Map.mapWithKey renderInputEntry flake.flattenedFlake_inputs
       ,
@@ -270,10 +367,10 @@ renderInputEntry name input = case input.flattenedInput_ref of
   -- An input carrying a `follows` may not also carry a flake reference, so an
   -- alias is emitted on its own.
   Left followsPath -> renderAliasEntry name followsPath
-  Right fetchable ->
+  Right refs ->
     renderRefEntry
       name
-      (withFlakeAttr input.flattenedInput_isFlake fetchable)
+      (withFlakeAttr input.flattenedInput_isFlake refs.nodeRefs_original)
       input.flattenedInput_edges
 
 -- | Nix takes an input to be a flake unless told otherwise, so only the
@@ -368,7 +465,7 @@ renderSourceOnlyFlakeNix srcRef =
         , "  inputs = {"
         ]
       , renderRefEntry
-          (InputName "src")
+          sourceOnlyInputName
           (withFlakeAttr False $ fetchableRef srcRef)
           Map.empty
       ,
@@ -402,6 +499,166 @@ unpackedSourceFlakeNix =
   }
   """
 
+--------------------------------------------------------------------------------
+-- Rendering a lock
+--------------------------------------------------------------------------------
+
+-- | Render the @flake.lock@ of a packed thunk whose upstream is itself a flake.
+--
+-- Written here rather than by running @nix flake lock@ on the generated flake.
+-- Locking has to resolve every input a flake declares, and this one declares
+-- an input per node of upstream's lock, so packing would fetch upstream's
+-- whole transitive closure and fail on any single pin it could not reach.
+-- Every reference and hash the lock needs is already in upstream's own lock,
+-- which makes this file a relabelling of that one rather than new information.
+--
+-- Only valid when 'flattenedFlake_complete' holds: an input the generated
+-- flake did not fully declare is one Nix would have had to work out for
+-- itself, and a lock missing it is not a lock.
+renderFlakeLock :: FlattenedFlake -> LBS.ByteString
+renderFlakeLock flake = renderLockNodes (rootLockNode flake) (lockNodes flake)
+
+-- | The root node of the generated flake's lock: an edge to the thunk's source
+-- and one to every input, with the aliases recorded as the paths they follow.
+rootLockNode :: FlattenedFlake -> LockNode
+rootLockNode flake =
+  LockNode
+    { lockNode_edges =
+        Map.insert
+          flake.flattenedFlake_sourceName
+          (LockEdge_Node flake.flattenedFlake_sourceName)
+          (Map.mapWithKey rootLockEdge flake.flattenedFlake_inputs)
+    , lockNode_refs = Nothing
+    , lockNode_isFlake = True
+    }
+
+rootLockEdge :: InputName -> FlattenedInput -> LockEdge
+rootLockEdge name input = case input.flattenedInput_ref of
+  Left followsPath -> LockEdge_Follows followsPath
+  Right _ -> LockEdge_Node name
+
+-- | Every node of the generated flake's lock, keyed by node id. Node ids are
+-- the input names, which are unique by construction, and an input that is only
+-- a @follows@ has no node at all: it lives on the edge that reaches it.
+lockNodes :: FlattenedFlake -> Map InputName LockNode
+lockNodes flake =
+  Map.insert flake.flattenedFlake_sourceName sourceNode $
+    Map.mapMaybe inputLockNode flake.flattenedFlake_inputs
+  where
+    sourceNode =
+      LockNode
+        { lockNode_edges = LockEdge_Follows . rootFollows <$> flake.flattenedFlake_sourceEdges
+        , lockNode_refs = Just flake.flattenedFlake_sourceRefs
+        , lockNode_isFlake = True
+        }
+
+inputLockNode :: FlattenedInput -> Maybe LockNode
+inputLockNode input = case input.flattenedInput_ref of
+  Left _ -> Nothing
+  Right refs ->
+    Just
+      LockNode
+        { lockNode_edges = LockEdge_Follows . rootFollows <$> input.flattenedInput_edges
+        , lockNode_refs = Just refs
+        , lockNode_isFlake = input.flattenedInput_isFlake
+        }
+
+-- | Every edge of a non-root node points at one of our root-level inputs,
+-- which from inside the lock is a one-step walk from the root.
+rootFollows :: InputName -> FollowsPath
+rootFollows name = FollowsPath [name]
+
+-- | Render the @flake.lock@ of a packed thunk whose upstream is not a flake.
+-- It has the one input the flake declares, and nothing else.
+renderSourceOnlyFlakeLock :: NodeRefs -> LBS.ByteString
+renderSourceOnlyFlakeLock srcRefs =
+  renderLockNodes
+    LockNode
+      { lockNode_edges = Map.singleton sourceOnlyInputName $ LockEdge_Node sourceOnlyInputName
+      , lockNode_refs = Nothing
+      , lockNode_isFlake = True
+      }
+    $ Map.singleton
+      sourceOnlyInputName
+      LockNode
+        { lockNode_edges = Map.empty
+        , lockNode_refs = Just srcRefs
+        , lockNode_isFlake = False
+        }
+
+renderLockNodes :: LockNode -> Map InputName LockNode -> LBS.ByteString
+renderLockNodes root nodes = encodePretty' lockJsonConfig $ lockJson root nodes
+
+lockJson :: LockNode -> Map InputName LockNode -> Aeson.Value
+lockJson root nodes =
+  Aeson.object
+    [ ("nodes", Aeson.object $ nodeEntry rootId root : (uncurry nodeEntry <$> Map.toList nodes))
+    , ("root", Aeson.String $ unInputName rootId)
+    , ("version", lockVersion)
+    ]
+  where
+    rootId = rootLockNodeId nodes
+    nodeEntry name node = (Key.fromText $ unInputName name, lockNodeJson node)
+
+-- | The id of the lock's root node. Nix takes it from the top-level @root@
+-- field rather than by name, so it can step aside on the off chance upstream
+-- has an input called @root@.
+rootLockNodeId :: Map InputName LockNode -> InputName
+rootLockNodeId nodes = freshInputName (Map.keysSet nodes) $ InputName "root"
+
+lockNodeJson :: LockNode -> Aeson.Value
+lockNodeJson node = Aeson.object $ fold [edges, refs, flake]
+  where
+    edges, refs, flake :: [Aeson.Pair]
+    edges = [("inputs", lockEdgesJson node.lockNode_edges) | not $ Map.null node.lockNode_edges]
+    refs = foldMap refsJson node.lockNode_refs
+    -- Nix takes an input to be a flake unless told otherwise.
+    flake = [("flake", Aeson.Bool False) | not node.lockNode_isFlake]
+    refsJson r =
+      [ ("locked", flakeRefJson r.nodeRefs_locked)
+      , ("original", flakeRefJson r.nodeRefs_original)
+      ]
+
+lockEdgesJson :: Map InputName LockEdge -> Aeson.Value
+lockEdgesJson edges =
+  Aeson.object [(Key.fromText $ unInputName name, lockEdgeJson edge) | (name, edge) <- Map.toList edges]
+
+lockEdgeJson :: LockEdge -> Aeson.Value
+lockEdgeJson = \case
+  LockEdge_Node target -> Aeson.String $ unInputName target
+  LockEdge_Follows followsPath -> Aeson.toJSON $ unInputName <$> unFollowsPath followsPath
+
+flakeRefJson :: FlakeRef -> Aeson.Value
+flakeRefJson flakeRef =
+  Aeson.object [(Key.fromText $ unAttrName name, refValueJson value) | (name, value) <- Map.toList $ unFlakeRef flakeRef]
+
+refValueJson :: FlakeRefValue -> Aeson.Value
+refValueJson = \case
+  FlakeRefValue_String s -> Aeson.String s
+  FlakeRefValue_Bool b -> Aeson.Bool b
+  FlakeRefValue_Int n -> Aeson.Number $ fromInteger n
+
+-- | Two-space indentation with sorted keys and a trailing newline, which is
+-- how Nix writes a lock itself. Nothing reads the file back by content, but a
+-- generated file that a person may open should not look foreign next to the
+-- ones Nix wrote.
+lockJsonConfig :: Config
+lockJsonConfig =
+  defConfig
+    { confIndent = Spaces 2
+    , confCompare = compare
+    , confTrailingNewline = True
+    }
+
+-- | The lock format this writes. Nix has kept this at 7 since flakes were
+-- introduced, and refuses anything newer than it knows.
+lockVersion :: Aeson.Value
+lockVersion = Aeson.Number 7
+
+-- | The name a thunk of a repository that is not a flake gives its one input.
+sourceOnlyInputName :: InputName
+sourceOnlyInputName = InputName "src"
+
 -- | The lock of a flake with no inputs. Written directly rather than by
 -- invoking Nix, so that packing a repository which is not a flake does not
 -- require the flakes feature to be enabled.
@@ -422,14 +679,14 @@ emptyFlakeLock =
 --------------------------------------------------------------------------------
 
 -- | Ties the knot between the context and the references it computes.
-flattenContext :: FlakeRef -> FlakeLock -> FlattenContext
-flattenContext srcRef lock = ctx
+flattenContext :: NodeRefs -> FlakeLock -> FlattenContext
+flattenContext srcRefs lock = ctx
   where
     names = nodeInputNames lock
     ctx =
       FlattenContext
-        { flattenContext_sourceName = sourceInputName names
-        , flattenContext_sourceRef = fetchableRef srcRef
+        { flattenContext_sourceName = sourceInputName $ takenInputNames lock names
+        , flattenContext_sourceRefs = srcRefs
         , flattenContext_lock = lock
         , flattenContext_origins = discoverOrigins lock
         , flattenContext_refs = Map.mapWithKey (nodeRef ctx) $ nonRootNodes lock
@@ -444,32 +701,49 @@ flattenedInput ctx nodeId node =
     , flattenedInput_edges = overridableEdges ctx $ nodeEdges ctx.flattenContext_lock node
     }
 
--- | The reference the thunk should bind a single node to.
-nodeRef :: FlattenContext -> NodeId -> FlakeNode -> Either FollowsPath FlakeRef
+-- | The references the thunk should bind a single node to.
+nodeRef :: FlattenContext -> NodeId -> FlakeNode -> Either FollowsPath NodeRefs
 nodeRef ctx nodeId node = fromMaybe (Left $ aliasPath ctx nodeId) $ case relativePathOf node of
-  Nothing -> Right <$> (fetchableNodeRef =<< node.flakeNode_locked)
+  Nothing -> Right <$> (fetchableNodeRefs =<< node.flakeNode_locked)
   Just rel -> do
-    parentRef <- parentRefOf ctx nodeId
-    Right <$> withRelativeDir parentRef rel
+    parent <- parentRefsOf ctx nodeId
+    Right <$> withRelativeDirRefs parent rel
 
 -- | A locked node of type @path@ names either a store path or a location on
 -- whichever machine wrote the lock, and neither means anything to anyone else.
 -- Such a node can only be expressed when 'withRelativeDir' restates it as a
 -- subdirectory of its parent; otherwise it has to be aliased, since emitting
 -- the reference without its @path@ would produce a reference to nothing.
-fetchableNodeRef :: FlakeRef -> Maybe FlakeRef
-fetchableNodeRef locked = do
+--
+-- The locked form is upstream's own, verbatim: it is already the answer to
+-- what this node resolves to, hashes included.
+fetchableNodeRefs :: FlakeRef -> Maybe NodeRefs
+fetchableNodeRefs locked = do
   guard $
     Map.lookup (AttrName "type") (unFlakeRef locked)
       /= Just (FlakeRefValue_String "path")
-  pure $ fetchableRef locked
+  pure
+    NodeRefs
+      { nodeRefs_original = fetchableRef locked
+      , nodeRefs_locked = locked
+      }
 
-parentRefOf :: FlattenContext -> NodeId -> Maybe FlakeRef
-parentRefOf ctx nodeId = do
+-- | Re-express both of a parent's references as the same subdirectory. The
+-- locked one keeps the parent's hashes, since it is the same tree, which is
+-- what Nix records for a @dir@ input too.
+withRelativeDirRefs :: NodeRefs -> FilePath -> Maybe NodeRefs
+withRelativeDirRefs parent rel =
+  NodeRefs
+    <$> withRelativeDir parent.nodeRefs_original rel
+    <*> withRelativeDir parent.nodeRefs_locked rel
+
+parentRefsOf :: FlattenContext -> NodeId -> Maybe NodeRefs
+parentRefsOf ctx nodeId = do
   origin <- Map.lookup nodeId ctx.flattenContext_origins
-  case origin.nodeOrigin_parent of
-    Nothing -> Just ctx.flattenContext_sourceRef
-    Just parentId -> rightToMaybe =<< Map.lookup parentId ctx.flattenContext_refs
+  site <- origin.nodeOrigin_declaredIn
+  case site of
+    DeclarationSite_Source -> Just ctx.flattenContext_sourceRefs
+    DeclarationSite_Node parentId -> rightToMaybe =<< Map.lookup parentId ctx.flattenContext_refs
 
 -- | Where a node sits relative to the thunk's source, for nodes that cannot be
 -- given a reference of their own.
@@ -494,32 +768,75 @@ nonRootNodes lock = Map.delete lock.flakeLock_root lock.flakeLock_nodes
 -- | The name the thunk's own source is bound to. Upstream's inputs occupy
 -- root-level names too, so on the off chance one of them is already called
 -- @upstream@, pick another name rather than colliding.
-sourceInputName :: Map NodeId InputName -> InputName
-sourceInputName names = freshInputName (Set.fromList $ Map.elems names) $ InputName "upstream"
+sourceInputName :: Set InputName -> InputName
+sourceInputName taken = freshInputName taken $ InputName "upstream"
 
--- | Breadth-first walk of upstream's lock, recording where each node was first
--- reached from.
+-- | Every root-level name the generated flake binds for upstream: the name
+-- each node is exposed under, plus the alias names upstream also used.
+takenInputNames :: FlakeLock -> Map NodeId InputName -> Set InputName
+takenInputNames lock names = Map.keysSet (rootEdges lock) <> Set.fromList (toList names)
+
+-- | Where each node of upstream's lock was first reached from.
+--
+-- Two walks, because only a direct edge is a declaration. A @follows@ rebinds
+-- a node that some other flake declared, so treating the flake that follows it
+-- as its parent would resolve a relative path against the wrong repository:
+-- the first walk therefore crosses direct edges only. The second crosses every
+-- edge, so that a node reachable no other way still has a path to be aliased
+-- by, but it contributes no declaration site.
 discoverOrigins :: FlakeLock -> Map NodeId NodeOrigin
-discoverOrigins lock = go Map.empty $ nodeChildren lock lock.flakeLock_root []
+discoverOrigins lock =
+  Map.union
+    (originsVia declaredEdgesOf lock)
+    (undeclared $ originsVia edgesOf lock)
+
+-- | Breadth-first walk of upstream's lock from its root over a chosen subset
+-- of each node's edges, recording where each node was first reached from.
+originsVia
+  :: (FlakeLock -> NodeId -> Map InputName FlakeEdge)
+  -> FlakeLock
+  -> Map NodeId NodeOrigin
+originsVia edges lock = go Map.empty $ childrenVia edges lock lock.flakeLock_root []
   where
     go acc [] = acc
-    go acc ((parentId, prefix, nodeId) : rest)
+    go acc ((site, prefix, nodeId) : rest)
       | nodeId `Map.member` acc || nodeId == lock.flakeLock_root = go acc rest
       | otherwise =
           go
-            (Map.insert nodeId (NodeOrigin parentId prefix) acc)
-            (rest <> nodeChildren lock nodeId prefix)
+            (Map.insert nodeId (NodeOrigin (Just site) prefix) acc)
+            (rest <> childrenVia edges lock nodeId prefix)
 
-nodeChildren :: FlakeLock -> NodeId -> [InputName] -> [(Maybe NodeId, [InputName], NodeId)]
-nodeChildren lock nodeId prefix =
-  [ (parentId, prefix <> [name], child)
-  | (name, edge) <- Map.toList $ edgesOf lock nodeId
+childrenVia
+  :: (FlakeLock -> NodeId -> Map InputName FlakeEdge)
+  -> FlakeLock
+  -> NodeId
+  -> [InputName]
+  -> [(DeclarationSite, [InputName], NodeId)]
+childrenVia edges lock nodeId prefix =
+  [ (site, prefix <> [name], child)
+  | (name, edge) <- Map.toList $ edges lock nodeId
   , Just child <- [resolveEdge lock edge]
   ]
   where
-    -- The root's own children have no parent node: their parent is the thunk's
-    -- source, which is not itself part of upstream's lock.
-    parentId = if nodeId == lock.flakeLock_root then Nothing else Just nodeId
+    -- The root's own children are declared by the thunk's source, which is not
+    -- itself part of upstream's lock.
+    site
+      | nodeId == lock.flakeLock_root = DeclarationSite_Source
+      | otherwise = DeclarationSite_Node nodeId
+
+-- | Drop the declaration sites of a walk that was allowed to cross @follows@
+-- edges. Whatever it recorded as a parent may not be one.
+undeclared :: Map NodeId NodeOrigin -> Map NodeId NodeOrigin
+undeclared = fmap $ \origin -> origin {nodeOrigin_declaredIn = Nothing}
+
+-- | The edges of a node that declare what they point at, which a @follows@
+-- does not.
+declaredEdgesOf :: FlakeLock -> NodeId -> Map InputName FlakeEdge
+declaredEdgesOf lock = Map.filter declares . edgesOf lock
+  where
+    declares = \case
+      FlakeEdge_Node _ -> True
+      FlakeEdge_Follows _ -> False
 
 edgesOf :: FlakeLock -> NodeId -> Map InputName FlakeEdge
 edgesOf lock nodeId = foldMap (.flakeNode_inputs) $ Map.lookup nodeId lock.flakeLock_nodes
@@ -601,6 +918,26 @@ normaliseRelative = fmap (joinPath . reverse) . foldM step [] . splitDirectories
         [] -> Nothing
         _innermost : outer -> Just outer
       seg -> Just $ seg : acc
+
+-- | The references a lock records for the repository a thunk points at.
+--
+-- Unlike upstream's own nodes, this one is not in any lock to copy from, so
+-- the attributes a fetch discovers have to be handed in by whoever did the
+-- fetch. They are layered under the reference the thunk pins, which stays
+-- authoritative for anything they disagree on.
+sourceNodeRefs
+  :: FlakeRef
+  -- ^ The reference the thunk pins
+  -> FlakeRef
+  -- ^ What fetching it discovered, e.g. @narHash@ and @lastModified@
+  -> NodeRefs
+sourceNodeRefs srcRef discovered =
+  NodeRefs
+    { nodeRefs_original = original
+    , nodeRefs_locked = FlakeRef $ Map.union (unFlakeRef original) (unFlakeRef discovered)
+    }
+  where
+    original = fetchableRef srcRef
 
 -- | Keep only the attributes of a locked node that describe /how to fetch it/,
 -- and so are meaningful when copied into an input. Everything else a lock

@@ -218,16 +218,30 @@ declared as a relative path escaping its repository cannot be given a reference
 of its own, so it is exposed as an alias: readable, but not overridable.
 
 When the repository is not a flake at all, the generated flake has no inputs to
-expose and provides the fetched source as `src`.
+expose and provides the fetched source as `src`. `src` is a fetched tree rather
+than a bare path, so `src.outPath` and `src.narHash` are both there.
 
-The flake interface survives `nix-thunk unpack`, so a project can keep building
-while a dependency is checked out for development. An unpacked thunk of a flake
-repository is that repository's own flake, which exposes the same outputs and
-the same input names. An unpacked thunk of a repository that is not a flake gets
-a generated `flake.nix` and `flake.lock` written into the checkout, providing
-the same `src` output; they are hidden through `.git/info/exclude` so the
-checkout still reads as clean, and packing removes them again. If you write your
-own `flake.nix` in an unpacked checkout, nix-thunk leaves it alone.
+The `flake.lock` beside it is written from upstream's own lock rather than by
+running `nix flake lock`, so packing does not fetch the repositories upstream
+depends on and does not fail when one of them is unreachable. The result is the
+lock Nix would have written: running `nix flake lock` on a packed thunk leaves
+it alone.
+
+If you do not want any of this, `create`, `pack` and `update` take `--no-flake`
+and write the newest format that carries no flake files. The format belongs to
+the thunk, so `unpack` keeps whichever one it finds, and packing without the
+flag brings a thunk up to the newest.
+
+The flake interface survives `nix-thunk unpack` and `nix-thunk worktree`, so a
+project can keep building while a dependency is checked out for development. An
+unpacked thunk of a flake repository is that repository's own flake, which
+exposes the same outputs and the same input names. An unpacked thunk of a
+repository that is not a flake gets a generated `flake.nix` and `flake.lock`
+written into the checkout, providing the same `src` output in the same shape;
+they are hidden through git's `info/exclude` so the checkout still reads as
+clean, and packing removes them again. Nothing is written if the repository
+brings a `flake.nix` or a `flake.lock` of its own, and a `flake.nix` you write
+yourself afterwards is left alone.
 
 ## Binary cache
 

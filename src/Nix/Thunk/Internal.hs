@@ -19,7 +19,7 @@ import Control.Applicative
 import Control.Exception (Exception, displayException, throw, try)
 import Control.Lens (ifor, ifor_, makePrisms, (.~))
 import Control.Monad
-import Control.Monad.Catch (MonadCatch, MonadMask, handle)
+import Control.Monad.Catch (MonadCatch, MonadMask, handle, onException)
 import Control.Monad.Except
 import Control.Monad.Extra (findM)
 import Control.Monad.IO.Class (MonadIO (liftIO))
@@ -38,7 +38,7 @@ import Data.Containers.ListUtils (nubOrd)
 import Data.Data (Data)
 import Data.Default
 import Data.Either.Combinators (fromRight', rightToMaybe)
-import Data.Foldable (for_, toList)
+import Data.Foldable (find, fold, for_, toList)
 import Data.Function
 import Data.List qualified as L
 import Data.List.NonEmpty (NonEmpty (..), nonEmpty)
@@ -185,8 +185,12 @@ data GitSource = GitSource
   }
   deriving stock (Eq, Ord, Show)
 
-newtype ThunkConfig = ThunkConfig
+data ThunkConfig = ThunkConfig
   { _thunkConfig_private :: Maybe Bool
+  , _thunkConfig_noFlake :: Bool
+  -- ^ Write the newest thunk format that carries no flake files. The thunk is
+  -- then not usable as a flake input, which is the point: it is for projects
+  -- that do not want the interface, and for anyone who cannot produce it.
   }
   deriving stock (Show)
 
@@ -562,21 +566,48 @@ parseGitSource v = do
       , _gitSource_private = fromMaybe False private
       }
 
-overwriteThunk :: MonadNixThunk m => FilePath -> ThunkPtr -> m ()
-overwriteThunk target thunk = do
+overwriteThunk :: MonadNixThunk m => ThunkConfig -> FilePath -> ThunkPtr -> m ()
+overwriteThunk config target thunk = do
   -- Ensure that this directory is a valid thunk (i.e. so we aren't losing any data)
   readThunk target >>= \case
     Left e -> failReadThunkErrorWhile "while overwriting" e
     Right _ -> pure ()
 
-  -- TODO: Is there a safer way to do this overwriting?
-  liftIO $ removePathForcibly target
-  createThunk target $ Right thunk
+  -- Assemble the new thunk beside the old one and swap it in only once it is
+  -- complete, as packing does. Writing a thunk reaches the network to generate
+  -- its flake files, and a failure part way through would otherwise leave
+  -- behind a directory that is no longer the thunk it used to be: one missing
+  -- its flake files reads as the previous thunk version, whose loaders are
+  -- identical, so the format would be silently rolled back rather than the
+  -- update simply failing.
+  let (thunkParent, thunkName) = splitFileName target
+  withTempDirectory thunkParent thunkName $ \tmpThunk -> do
+    let staged = tmpThunk </> "packed"
+    createThunkWithSpec staged (thunkSpecFor config thunk) (Just thunk)
+    liftIO $ do
+      removePathForcibly target
+      renameDirectory staged target
+
+-- | The format a newly written thunk is given.
+--
+-- The newest one, unless the caller asked to stay off flakes, in which case
+-- the newest one carrying no flake files. Choosing by that property rather
+-- than by name means a spec added later needs no change here.
+thunkSpecFor :: ThunkConfig -> ThunkPtr -> ThunkSpec
+thunkSpecFor config thunk
+  | _thunkConfig_noFlake config = fromMaybe newest $ find (not . specHasFlakeFiles) specs
+  | otherwise = newest
+  where
+    specs = thunkPtrToSpecs thunk
+    newest = NonEmpty.head specs
 
 thunkPtrToSpec :: ThunkPtr -> ThunkSpec
-thunkPtrToSpec thunk = case _thunkPtr_source thunk of
-  ThunkSource_GitHub _ -> NonEmpty.head gitHubThunkSpecs
-  ThunkSource_Git _ -> NonEmpty.head gitThunkSpecs
+thunkPtrToSpec = NonEmpty.head . thunkPtrToSpecs
+
+thunkPtrToSpecs :: ThunkPtr -> NonEmpty ThunkSpec
+thunkPtrToSpecs thunk = case _thunkPtr_source thunk of
+  ThunkSource_GitHub _ -> gitHubThunkSpecs
+  ThunkSource_Git _ -> gitThunkSpecs
 
 -- It's important that formatting be very consistent here, because
 -- otherwise when people update thunks, their patches will be messy
@@ -655,10 +686,24 @@ createThunk' config = do
     ThunkCreateSource_Relative _ -> case _thunkCreateConfig_destination config of
       Nothing -> failWith "When using a relative path as the thunk source, the destination path must be specified."
       Just dst -> pure dst
-  createThunk destination $ Right newThunkPtr
+  createThunkWithSpec
+    destination
+    (thunkSpecFor (_thunkCreateConfig_config config) newThunkPtr)
+    (Just newThunkPtr)
 
+-- | Write a thunk in the newest format its pointer allows.
 createThunk :: MonadNixThunk m => FilePath -> Either ThunkSpec ThunkPtr -> m ()
-createThunk target ptrInfo = do
+createThunk target = \case
+  Left spec -> createThunkWithSpec target spec Nothing
+  Right ptr -> createThunkWithSpec target (thunkPtrToSpec ptr) (Just ptr)
+
+-- | Write a thunk in a given format.
+--
+-- The format is the caller's to choose rather than a function of the pointer,
+-- since @--no-flake@ asks for a thunk one format older than the newest, and
+-- unpacking keeps whichever format the thunk it is unpacking already had.
+createThunkWithSpec :: MonadNixThunk m => FilePath -> ThunkSpec -> Maybe ThunkPtr -> m ()
+createThunkWithSpec target spec mPtr = do
   isdir <- liftIO $ doesDirectoryExist target
   when isdir $ do
     isempty <- null <$> liftIO (listDirectory target)
@@ -666,19 +711,18 @@ createThunk target ptrInfo = do
 
   ifor_ (_thunkSpec_files spec) $ \path -> \case
     ThunkFileSpec_FileMatches content -> withReadyPath path $ \p -> liftIO $ writeUtf8File p content
-    ThunkFileSpec_Ptr _ -> case ptrInfo of
-      Left _ -> pure () -- We can't write the ptr without it
-      Right ptr -> withReadyPath path $ \p -> liftIO $ LBS.writeFile p (encodeThunkPtrData ptr)
+    -- We can't write the ptr without it
+    ThunkFileSpec_Ptr _ -> for_ mPtr $ \ptr ->
+      withReadyPath path $ \p -> liftIO $ LBS.writeFile p (encodeThunkPtrData ptr)
     -- Written below: these are derived from the repository the thunk points
     -- at, which cannot be fetched until the loaders above have been written.
     ThunkFileSpec_Generated _ -> pure ()
     _ -> pure ()
 
-  case ptrInfo of
-    Left _ -> pure () -- We can't fetch the source without the ptr
-    Right ptr -> when (specHasFlakeFiles spec) $ writeThunkFlakeFiles target ptr
+  -- We can't fetch the source without the ptr
+  for_ mPtr $ \ptr ->
+    when (specHasFlakeFiles spec) $ writeThunkFlakeFiles target ptr
   where
-    spec = either id thunkPtrToSpec ptrInfo
     withReadyPath path f = do
       let fullPath = target </> path
       putLog Debug $ "Writing thunk file " <> T.pack fullPath
@@ -694,34 +738,75 @@ specHasFlakeFiles = any isGenerated . _thunkSpec_files
 writeThunkFlakeFiles :: MonadNixThunk m => FilePath -> ThunkPtr -> m ()
 writeThunkFlakeFiles target ptr = do
   let srcRef = thunkPtrToFlakeRef ptr
-  srcPath <- fetchFlakeRef srcRef
-  liftIO (doesFileExist $ srcPath </> flakeNixFileName) >>= \case
-    False -> do
-      liftIO $ writeUtf8File (target </> flakeNixFileName) $ Flake.renderSourceOnlyFlakeNix srcRef
-      nixFlakeLock target
+  fetched <- fetchFlakeRef srcRef
+  let srcRefs = Flake.sourceNodeRefs srcRef $ _fetchedFlakeRef_locked fetched
+  liftIO (doesFileExist $ _fetchedFlakeRef_outPath fetched </> flakeNixFileName) >>= \case
+    False -> liftIO $ do
+      writeUtf8File (target </> flakeNixFileName) $ Flake.renderSourceOnlyFlakeNix srcRef
+      LBS.writeFile (target </> flakeLockFileName) $ Flake.renderSourceOnlyFlakeLock srcRefs
     True -> do
-      lock <- upstreamFlakeLock srcPath
-      liftIO $
-        writeUtf8File (target </> flakeNixFileName) $
-          Flake.renderFlakeNix $
-            Flake.flattenLock srcRef lock
-      nixFlakeLock target
+      lock <- upstreamFlakeLock $ _fetchedFlakeRef_outPath fetched
+      let flattened = Flake.flattenLock srcRefs lock
+      liftIO $ writeUtf8File (target </> flakeNixFileName) $ Flake.renderFlakeNix flattened
+      -- Upstream's lock already answers what every input of the generated
+      -- flake resolves to, so the thunk's own lock is written from it rather
+      -- than by asking Nix to resolve them all over again. Nix has to be asked
+      -- when the generated flake left something for upstream's lock to settle,
+      -- since then it is not this file that says what the inputs are.
+      if Flake.flattenedFlake_complete flattened
+        then liftIO $ LBS.writeFile (target </> flakeLockFileName) $ Flake.renderFlakeLock flattened
+        else do
+          putLog Debug $
+            "Some inputs of "
+              <> T.pack target
+              <> " could not be restated, so locking it has to resolve them."
+          nixFlakeLock target
 
--- | Fetch the repository a reference points at, and return its store path.
+-- | The repository a reference points at, once fetched.
+data FetchedFlakeRef = FetchedFlakeRef
+  { _fetchedFlakeRef_outPath :: FilePath
+  , _fetchedFlakeRef_locked :: Flake.FlakeRef
+  -- ^ What the fetch discovered that the reference did not already say, which
+  -- is what a lock records over and above the reference itself.
+  }
+
+instance Aeson.FromJSON FetchedFlakeRef where
+  parseJSON = Aeson.withObject "FetchedFlakeRef" $ \o ->
+    FetchedFlakeRef
+      <$> o Aeson..: "path"
+      <*> o Aeson..: "locked"
+
+-- | Fetch the repository a reference points at.
 --
 -- This deliberately goes through the same fetcher the generated flake will
 -- use, rather than through the thunk's own @thunk.nix@: it means a reference
 -- that Nix cannot resolve is caught while packing rather than by whoever tries
 -- to use the thunk. The revision is pinned, so the fetch is cached.
-fetchFlakeRef :: MonadNixThunk m => Flake.FlakeRef -> m FilePath
+fetchFlakeRef :: MonadNixThunk m => Flake.FlakeRef -> m FetchedFlakeRef
 fetchFlakeRef srcRef = do
-  let expr = "(builtins.fetchTree " <> Flake.renderFlakeRefExpr srcRef <> ").outPath"
+  -- The store path is reported as @path@ rather than @outPath@ on purpose:
+  -- @toJSON@ of an attribute set carrying an @outPath@ coerces the whole set
+  -- to that string, exactly as @toString@ would, and the rest of the object
+  -- would be lost.
+  let expr =
+        "let tree = builtins.fetchTree "
+          <> Flake.renderFlakeRefExpr srcRef
+          <> "; in builtins.toJSON { path = tree.outPath; locked = builtins.intersectAttrs "
+          <> lockedAttrsExpr
+          <> " tree; }"
   out <-
     withExitFailMessage ("nix eval: Failed to fetch " <> Flake.renderFlakeRefExpr srcRef) $
       readProcessAndLogStderr Debug $
         Cli.proc nixExePath $
           flakeArgs <> ["eval", "--impure", "--raw", "--expr", T.unpack expr]
-  pure $ T.unpack $ T.strip out
+  case Aeson.eitherDecodeStrict $ encodeUtf8 $ T.strip out of
+    Left e -> failWith $ "Could not read what fetching " <> Flake.renderFlakeRefExpr srcRef <> " produced:\n" <> T.pack e
+    Right fetched -> pure fetched
+
+-- | The attributes of a fetched tree that belong in a lock. The rest of what
+-- @fetchTree@ returns is either the tree itself or a restatement of these.
+lockedAttrsExpr :: Text
+lockedAttrsExpr = "{ lastModified = null; narHash = null; rev = null; revCount = null; }"
 
 -- | Upstream's own lock, which is what pins the revisions the thunk reproduces.
 -- An upstream shipping no lock has pinned nothing, so there is no alternative
@@ -773,10 +858,20 @@ nixFlakeMetadata srcPath = do
 
 nixFlakeLock :: MonadNixThunk m => FilePath -> m ()
 nixFlakeLock target =
-  withExitFailMessage ("nix flake lock: Failed to lock the flake of thunk " <> T.pack target) $
+  withExitFailMessage failureMessage $
     callProcessAndLogOutput (Debug, Debug) $
       Cli.proc nixExePath $
         flakeArgs <> ["flake", "lock", flakePathRef target]
+  where
+    -- Locking resolves every input the generated flake declares, which is one
+    -- per node of upstream's own lock, so this is where an upstream pin that
+    -- cannot be reached from here surfaces. Say so, rather than leaving the
+    -- reader to work out why packing wanted the network at all.
+    failureMessage =
+      "nix flake lock: Failed to lock the flake of thunk "
+        <> T.pack target
+        <> ".\nLocking has to resolve every input of the repository this thunk"
+        <> " points at, so this fails if any of them is unreachable from here."
 
 -- | Packing a thunk should not depend on how the user has configured Nix, so
 -- the features these commands need are requested explicitly.
@@ -850,14 +945,14 @@ updateThunkToLatest cfg target = do
                 (_thunkConfig_private $ _thunkUpdateConfig_thunk cfg)
                 (_thunkUpdateConfig_branch cfg)
                 (Just ref)
-            overwriteThunk target newThunkPtr
+            overwriteThunk (_thunkUpdateConfig_thunk cfg) target newThunkPtr
           Nothing -> do
             let newSrc :: ThunkSource
                 newSrc = case _thunkUpdateConfig_branch cfg of
                   Nothing -> _thunkPtr_source t
                   Just b -> setThunkSourceBranch (Just $ N b) $ _thunkPtr_source t
             rev <- getLatestRev newSrc
-            overwriteThunk target $
+            overwriteThunk (_thunkUpdateConfig_thunk cfg) target $
               modifyThunkPtrByConfig (_thunkUpdateConfig_thunk cfg) $
                 ThunkPtr
                   { _thunkPtr_source = newSrc
@@ -1475,7 +1570,7 @@ updateThunk p f = withSystemTempDirectory "obelisk-thunkptr-" $ \tmpDir -> do
           return tmpThunk
         Right _ -> failWith "Thunk is not packed"
     updateThunkFromTmp p' = do
-      _ <- packThunk' True (ThunkPackConfig False (ThunkConfig Nothing)) p'
+      _ <- packThunk' True (ThunkPackConfig False (ThunkConfig Nothing False)) p'
       callProcessAndLogOutput (Notice, Error) $
         Cli.proc cp ["-r", "-T", p', p]
 
@@ -1505,13 +1600,13 @@ unpackThunk' noTrail thunkDir =
     Left err -> failReadThunkErrorWhile "while unpacking" err
     -- TODO: Overwrite option that rechecks out thunk; force option to do so even if working directory is dirty
     Right ThunkData_Checkout -> failWith [i|Thunk at ${thunkDir} is already unpacked|]
-    Right (ThunkData_Packed _ tptr) -> do
+    Right (ThunkData_Packed spec tptr) -> do
       let (thunkParent, thunkName) = splitFileName thunkDir
       withTempDirectory thunkParent thunkName $ \tmpThunk -> do
+        -- The format the thunk already has, not the newest one: a thunk written
+        -- with @--no-flake@ has no flake interface to keep, and unpacking is not
+        -- the moment to give it one.
         let gitSrc = thunkSourceToGitSource $ _thunkPtr_source tptr
-            newSpec = case _thunkPtr_source tptr of
-              ThunkSource_GitHub _ -> NonEmpty.head gitHubThunkSpecs
-              ThunkSource_Git _ -> NonEmpty.head gitThunkSpecs
         withSpinner'
           ("Fetching thunk " <> T.pack thunkName)
           (finalMsg noTrail $ const $ "Fetched thunk " <> T.pack thunkName)
@@ -1519,64 +1614,116 @@ unpackThunk' noTrail thunkDir =
             let unpackedPath = tmpThunk </> unpackedDirName
             gitCloneForThunkUnpack gitSrc (_thunkRev_commit $ _thunkPtr_rev tptr) unpackedPath
 
-            when (specHasFlakeFiles newSpec) $ preserveFlakeInterface unpackedPath
+            when (specHasFlakeFiles spec) $ preserveFlakeInterface unpackedPath
 
             let normalizeMore = dropTrailingPathSeparator . normalise
             -- Only write meta data if the checkout is not inplace
             when (normalizeMore unpackedPath /= normalizeMore tmpThunk) $
-              createThunk tmpThunk $
-                Left newSpec
+              createThunkWithSpec tmpThunk spec Nothing
 
             liftIO $ do
               removePathForcibly thunkDir
               renameDirectory tmpThunk thunkDir
+
+-- | Take the generated flake interface out of a checkout for the duration of
+-- an action, and put it back if the action does not succeed.
+--
+-- Packing has to remove the generated files before the checkout is inspected,
+-- since the cleanliness check counts ignored files as unsaved work. A checkout
+-- that is then rejected has to be handed back to the developer exactly as it
+-- was found, or a pack that refused to do anything would still have broken
+-- every sibling flake that has the thunk as a @path:@ input.
+withoutPreservedFlakeInterface :: MonadNixThunk m => FilePath -> m a -> m a
+withoutPreservedFlakeInterface checkout act = do
+  discarded <- discardPreservedFlakeInterface checkout
+  let restore = when discarded $ preserveFlakeInterface checkout
+  (act `onException` restore) `catchError` \e -> restore *> throwError e
+
+-- | Undo 'preserveFlakeInterface', reporting whether it had anything to undo.
+--
+-- All or nothing, and only when the @flake.nix@ is still the one that was
+-- generated. Content alone cannot identify the @flake.lock@: an empty lock is
+-- byte for byte what Nix writes for any flake without inputs, so a repository
+-- that tracks one of its own would have it deleted. A @flake.nix@ the user has
+-- since written by hand leaves both files in place, and the cleanliness check
+-- goes on to report them.
+discardPreservedFlakeInterface :: MonadNixThunk m => FilePath -> m Bool
+discardPreservedFlakeInterface checkout = do
+  ours <- liftIO $ hasContent (checkout </> flakeNixFileName) Flake.unpackedSourceFlakeNix
+  when ours $ do
+    for_ generatedFlakeFiles $ \(name, _) -> do
+      putLog Debug $ "Removing generated " <> T.pack (checkout </> name)
+      liftIO $ removePathForcibly $ checkout </> name
+    excludeFile <- gitExcludeFile checkout
+    excluded <- liftIO $ readFileMaybe excludeFile
+    for_ excluded $ liftIO . writeUtf8File excludeFile . T.replace flakeExcludeBlock ""
+  pure ours
 
 -- | A packed thunk of a repository that is not itself a flake still exposes
 -- the fetched source as a flake output. Unpacking replaces the thunk with a
 -- bare checkout, which would leave anyone consuming it as a flake input with
 -- nothing to resolve, so the same interface is written into the checkout.
 --
--- Nothing is written when the repository brings its own @flake.nix@: that one
--- is the better answer, and shadowing it would corrupt the working tree. The
--- generated files are hidden through @.git\/info\/exclude@ rather than a
--- tracked ignore file, so the checkout still reads as clean and they cannot be
--- committed by accident.
+-- Nothing is written when the repository brings a @flake.nix@ or a
+-- @flake.lock@ of its own. Either one says the flake files here are not ours
+-- to write, and overwriting a tracked one would destroy work that no longer
+-- exists anywhere else.
+--
+-- The generated files are hidden through git's own @info\/exclude@ rather than
+-- a tracked ignore file, so the checkout still reads as clean and they cannot
+-- be committed by accident.
 preserveFlakeInterface :: MonadNixThunk m => FilePath -> m ()
 preserveFlakeInterface checkout = do
-  hasOwnFlake <- liftIO $ doesFileExist $ checkout </> flakeNixFileName
+  hasOwnFlake <- liftIO $ or <$> traverse (doesFileExist . (checkout </>) . fst) generatedFlakeFiles
   unless hasOwnFlake $ do
     putLog Debug $ "Writing flake files into checkout " <> T.pack checkout
+    excludeFile <- gitExcludeFile checkout
     liftIO $ do
-      writeUtf8File (checkout </> flakeNixFileName) Flake.unpackedSourceFlakeNix
-      writeUtf8File (checkout </> flakeLockFileName) Flake.emptyFlakeLock
-      let excludeFile = checkout </> ".git" </> "info" </> "exclude"
+      for_ generatedFlakeFiles $ \(name, content) -> writeUtf8File (checkout </> name) content
       createDirectoryIfMissing True $ takeDirectory excludeFile
-      appendUtf8File excludeFile $
-        T.unlines
-          [ ""
-          , "# Written by nix-thunk; removed when the thunk is packed."
-          , "/" <> T.pack flakeNixFileName
-          , "/" <> T.pack flakeLockFileName
-          ]
+      excluded <- readFileMaybe excludeFile
+      unless (flakeExcludeBlock `T.isInfixOf` fold excluded) $
+        appendUtf8File excludeFile flakeExcludeBlock
 
--- | Undo 'preserveFlakeInterface' before the checkout is inspected for
--- modifications, since the cleanliness check counts ignored files as unsaved
--- work. Only files whose content is exactly what was written are removed, so a
--- flake the user has since written by hand is left alone and still reported.
-discardPreservedFlakeInterface :: MonadNixThunk m => FilePath -> m ()
-discardPreservedFlakeInterface checkout =
-  for_
-    ( [ (flakeNixFileName, Flake.unpackedSourceFlakeNix)
-      , (flakeLockFileName, Flake.emptyFlakeLock)
-      ]
-        :: [(FilePath, Text)]
-    )
-    $ \(name, written) -> do
-      let path = checkout </> name
-      contents <- liftIO $ rightToMaybe <$> try @IOError (T.readFile path)
-      when (fmap T.strip contents == Just (T.strip written)) $ do
-        putLog Debug $ "Removing generated " <> T.pack path
-        liftIO $ removePathForcibly path
+-- | The flake interface written into an unpacked checkout, and exactly what is
+-- taken back out of it again.
+generatedFlakeFiles :: [(FilePath, Text)]
+generatedFlakeFiles =
+  [ (flakeNixFileName, Flake.unpackedSourceFlakeNix)
+  , (flakeLockFileName, Flake.emptyFlakeLock)
+  ]
+
+-- | Appended to git's @info\/exclude@ to hide the generated files, and matched
+-- as one block so that packing can take it back out.
+flakeExcludeBlock :: Text
+flakeExcludeBlock =
+  T.unlines $
+    [ ""
+    , "# Written by nix-thunk; removed when the thunk is packed."
+    ]
+      <> ["/" <> T.pack name | (name, _) <- generatedFlakeFiles]
+
+-- | Where git reads a repository's own ignore patterns from.
+--
+-- Asked of git rather than assembled from @.git\/info\/exclude@, because in a
+-- worktree @.git@ is a file and the real directory is elsewhere. Note that
+-- git shares this file between a repository and its worktrees, so a worktree
+-- of a thunk hides these names in the developer's own checkout too. They are
+-- names the repository does not use, or the files would not have been written
+-- at all, and the block is removed again when the thunk is packed.
+gitExcludeFile :: MonadNixThunk m => FilePath -> m FilePath
+gitExcludeFile checkout = do
+  out <- T.unpack . T.strip <$> readGitProcess checkout ["rev-parse", "--git-common-dir"]
+  let gitDir = if isAbsolute out then out else checkout </> out
+  pure $ gitDir </> "info" </> "exclude"
+
+readFileMaybe :: FilePath -> IO (Maybe Text)
+readFileMaybe path = rightToMaybe <$> try @IOError (T.readFile path)
+
+-- | Whether a file is present and holds the given text, ignoring surrounding
+-- whitespace.
+hasContent :: FilePath -> Text -> IO Bool
+hasContent path expected = (== Just (T.strip expected)) . fmap T.strip <$> readFileMaybe path
 
 gitCloneForThunkUnpack
   :: MonadNixThunk m
@@ -1649,7 +1796,13 @@ createWorktree thunkDir gitDir config =
                 , normalise worktreePath
                 , normalise thunkFullPath
                 ]
-            pure ()
+
+            -- A worktree stands in for the thunk just as an unpacked checkout
+            -- does, so it needs the same flake interface. Packing discards it
+            -- either way.
+            when (specHasFlakeFiles $ thunkPtrToSpec tptr) $
+              preserveFlakeInterface $
+                normalise thunkFullPath
 
 -- | Ensures that the git repo contains the revision specified in the ThunkPtr
 -- by doing fetch from remote if necessary.
@@ -1713,19 +1866,21 @@ packThunk' noTrail (ThunkPackConfig force thunkConfig) thunkDir =
       ("Packing thunk " <> T.pack thunkDir)
       (finalMsg noTrail $ const $ "Packed thunk " <> T.pack thunkDir)
       $ do
-        discardPreservedFlakeInterface thunkDir
         let checkClean = if force then CheckClean_NoCheck else CheckClean_FullCheck
-        (thunkPtr, isWorktree) <-
-          first (modifyThunkPtrByConfig thunkConfig)
-            <$> getThunkPtr checkClean thunkDir (_thunkConfig_private thunkConfig)
         -- Assemble the packed thunk beside the checkout and swap it in only once
         -- it is complete. Generating the flake files reaches the network, and a
         -- failure there must not leave the developer with neither their checkout
-        -- nor a readable thunk.
+        -- nor a readable thunk. Everything up to the swap therefore happens
+        -- with the checkout still intact, and its flake interface is put back
+        -- if any of it fails.
         let (thunkParent, thunkName) = splitFileName thunkDir
         withTempDirectory thunkParent thunkName $ \tmpThunk -> do
           let staged = tmpThunk </> "packed"
-          createThunk staged $ Right thunkPtr
+          (thunkPtr, isWorktree) <- withoutPreservedFlakeInterface thunkDir $ do
+            packed <-
+              first (modifyThunkPtrByConfig thunkConfig)
+                <$> getThunkPtr checkClean thunkDir (_thunkConfig_private thunkConfig)
+            packed <$ createThunkWithSpec staged (thunkSpecFor thunkConfig $ fst packed) (Just $ fst packed)
           if isWorktree
             then void $ do
               -- Remove the branch locally, and then remove the worktree
@@ -1737,10 +1892,10 @@ packThunk' noTrail (ThunkPackConfig force thunkConfig) thunkDir =
               readGitProcess thunkDir ["worktree", "remove", "."]
             else liftIO $ removePathForcibly thunkDir
           liftIO $ renameDirectory staged thunkDir
-        pure thunkPtr
+          pure thunkPtr
 
 modifyThunkPtrByConfig :: ThunkConfig -> ThunkPtr -> ThunkPtr
-modifyThunkPtrByConfig (ThunkConfig markPrivate') ptr = case markPrivate' of
+modifyThunkPtrByConfig config ptr = case _thunkConfig_private config of
   Nothing -> ptr
   Just markPrivate ->
     ptr

@@ -22,10 +22,12 @@
   When the repository is not a flake, the generated flake exposes the fetched
   source as `src` instead.
 
-  The flake interface survives `unpack`, so a project keeps building while a
-  dependency is checked out. For a repository that is not a flake, the same
-  files are written into the checkout and hidden through `.git/info/exclude`;
-  `pack` removes them again, and a `flake.nix` you wrote yourself is left alone.
+  The flake interface survives `unpack` and `worktree`, so a project keeps
+  building while a dependency is checked out. For a repository that is not a
+  flake, the same files are written into the checkout and hidden through git's
+  `info/exclude`; `pack` removes them again, nothing is written if the
+  repository has a `flake.nix` or `flake.lock` of its own, and a `flake.nix` you
+  wrote yourself is left alone.
 
   This introduces the `github-v9` and `git-v10` thunk specs. They fetch exactly
   as `github-v8` and `git-v9` do, and differ only in carrying the flake files.
@@ -35,6 +37,22 @@
   `thunkSource` in older, vendored copies of this repository's `default.nix`,
   which reject any file they do not recognise. Projects pinning an older
   nix-thunk for their Nix code need to update it before updating their thunks.
+
+* `create`, `pack` and `update` accept `--no-flake`, which writes a thunk in
+  the newest format that carries no flake files. Such a thunk cannot be used as
+  a flake input, so this is for projects that do not want the interface. The
+  format is a property of the thunk rather than of the tool: `unpack` keeps
+  whichever format the thunk it is unpacking already had, and packing without
+  the flag brings a thunk up to the newest one.
+
+* Packing no longer fetches the repositories a flake dependency points at. The
+  generated `flake.lock` is written from upstream's own lock, which already
+  records every reference and hash it needs, rather than by running
+  `nix flake lock` over inputs Nix would have to resolve one at a time. Packing
+  a thunk of a repository with a large dependency graph no longer downloads
+  that graph, and no longer fails when one of its pins is unreachable. Nix is
+  still asked when an input could not be restated, which happens when upstream
+  declares one as a path outside its own repository.
 
 * The attribute cache moved out of the thunk directory, into
   `$XDG_CACHE_HOME/nix-thunk`. A packed thunk is now also read as a flake

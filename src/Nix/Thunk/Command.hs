@@ -19,6 +19,7 @@ thunkConfig =
             <|> flag' (Just False) (long "public" <> help "Mark thunks as pointing to a public repository")
             <|> pure Nothing
         )
+    <*> switch (long "no-flake" <> help "Write thunks in the newest format that carries no flake files. Such a thunk cannot be used as a flake input.")
 
 thunkUpdateConfig :: Parser ThunkUpdateConfig
 thunkUpdateConfig =

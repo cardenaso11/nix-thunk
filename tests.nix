@@ -18,10 +18,13 @@ let
 
   # An upstream flake with a relative path input. It deliberately has no
   # external inputs, so that locking it needs no network.
+  # `subAlias` is a second root-level name for the same lock node, which is what
+  # a root `follows` produces. Both names have to survive into the thunk.
   flakeSample = pkgs.writeText "flake.nix" ''
     {
       inputs.sub.url = "path:./sub";
-      outputs = { self, sub }: {
+      inputs.subAlias.follows = "sub";
+      outputs = { self, sub, subAlias }: {
         value = "upstream";
         subValue = sub.value;
       };
@@ -43,10 +46,12 @@ let
     {
       inputs.mythunk.url = "path:/root/code/myflake";
       inputs.readsSub.follows = "mythunk/sub";
-      outputs = { self, mythunk, readsSub }: {
+      inputs.readsAlias.follows = "mythunk/subAlias";
+      outputs = { self, mythunk, readsSub, readsAlias }: {
         forwarded = mythunk.value;
         viaThunk = mythunk.subValue;
         read = readsSub.value;
+        readAlias = readsAlias.value;
       };
     }
   '';
@@ -267,12 +272,70 @@ in
           # The generated files must not read as work in progress, or packing
           # would refuse to continue.
           test -z "$(git -C ~/code/myapp status --porcelain)";
+        """)
 
-          # Packing discards them and restores the fetching flake.
+      with subtest("an unpacked thunk's source leaves out the generated flake files"):
+        # `nix eval` rather than `nix-instantiate --eval`, which is read-only
+        # and so never copies the filtered source into the store.
+        client.succeed("""
+          nix eval --impure --raw --expr '
+            let
+              pkgs = import <nixpkgs> {};
+              nix-thunk = import ~/code/default.nix {
+                inherit pkgs;
+                gitignoreSource = pkgs.lib.cleanSource;
+              };
+              src = (nix-thunk.thunkSource ~/code/myapp).outPath;
+            in
+              assert builtins.pathExists (src + "/default.nix");
+              assert !builtins.pathExists (src + "/flake.nix");
+              assert !builtins.pathExists (src + "/flake.lock");
+              src
+          ' >/dev/null;
+        """)
+
+      with subtest("a refused pack leaves the flake interface in place"):
+        client.succeed("touch ~/code/myapp/uncommitted;")
+        client.fail("nix-thunk pack ~/code/myapp;")
+        client.succeed("""
+          test -f ~/code/myapp/flake.nix;
+          test -f ~/code/myapp/flake.lock;
+          rm ~/code/myapp/uncommitted;
+        """)
+
+      with subtest("packing discards the generated files and restores the fetching flake"):
+        client.succeed("""
           nix-thunk pack ~/code/myapp;
           grep -qF 'inherit src' ~/code/myapp/flake.nix;
           grep -qF 'flake = false' ~/code/myapp/flake.nix;
+
+          # nix-thunk writes the lock itself. Nix leaving it untouched is what
+          # says the file is complete and up to date, since anything it had to
+          # resolve for itself it would also have rewritten.
+          cp ~/code/myapp/flake.lock /tmp/myapp.lock.packed;
+          (cd ~/code/myapp && nix flake lock);
+          cmp ~/code/myapp/flake.lock /tmp/myapp.lock.packed;
+
           nix-thunk unpack ~/code/myapp;
+        """)
+
+      with subtest("--no-flake writes a thunk with no flake interface"):
+        client.succeed("""
+          nix-thunk create --no-flake -b master root@githost:/root/myorg/myapp.git ~/code/myapp-noflake;
+          test -f ~/code/myapp-noflake/thunk.nix;
+          test ! -e ~/code/myapp-noflake/flake.nix;
+          test ! -e ~/code/myapp-noflake/flake.lock;
+          nix-build ~/code/myapp-noflake;
+
+          # Unpacking keeps whichever format the thunk has, so there is no
+          # interface to preserve here and none is written.
+          nix-thunk unpack ~/code/myapp-noflake;
+          test ! -e ~/code/myapp-noflake/flake.nix;
+          test -z "$(git -C ~/code/myapp-noflake status --porcelain)";
+
+          # Packing without the flag brings it up to the newest format.
+          nix-thunk pack ~/code/myapp-noflake;
+          test -f ~/code/myapp-noflake/flake.nix;
         """)
 
       with subtest("a flake repo can be pushed to the remote"):
@@ -305,8 +368,16 @@ in
           test -n "$rev";
           grep -qF "$rev" ~/code/myflake/flake.lock;
 
-          # Upstream's own input is exposed under upstream's own name.
+          # Upstream's own inputs are exposed under upstream's own names, both
+          # of the names that resolve to the same node included.
           grep -qF '"sub"' ~/code/myflake/flake.nix;
+          grep -qF '"subAlias"' ~/code/myflake/flake.nix;
+
+          # The lock nix-thunk wrote is the one Nix would have written: it
+          # leaves the file alone rather than resolving the inputs again.
+          cp ~/code/myflake/flake.lock /tmp/myflake.lock.packed;
+          (cd ~/code/myflake && nix flake lock);
+          cmp ~/code/myflake/flake.lock /tmp/myflake.lock.packed;
         """)
 
       with subtest("the packed thunk forwards outputs and follows can read its inputs"):
@@ -318,6 +389,7 @@ in
           test "$(nix eval --raw .#forwarded)" = "upstream";
           test "$(nix eval --raw .#viaThunk)" = "sub";
           test "$(nix eval --raw .#read)" = "sub";
+          test "$(nix eval --raw .#readAlias)" = "sub";
         """)
 
       with subtest("the thunk's inputs can be overridden"):
@@ -405,6 +477,11 @@ in
           if [ ! -z $branch ]; then
              exit 1
           fi
+
+          # A worktree stands in for the thunk, so it carries the same flake
+          # interface an unpacked checkout does, and reads as clean.
+          test -f ~/code/myapp-2/flake.nix;
+          test -z "$(git -C ~/code/myapp-2 status --porcelain)";
         """);
 
       with subtest("gives error when packing worktree on detached HEAD"):
