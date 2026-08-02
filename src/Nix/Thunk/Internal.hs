@@ -383,6 +383,13 @@ appendUtf8File path = BSC.appendFile path . encodeUtf8
 -- | A path from which our known-good nixpkgs can be fetched.
 -- __NOTE__: This path is hardcoded, and only exists so subsumed thunk
 -- specs (v7 specifically) can be parsed.
+--
+-- The v7 loaders substitute it into a @\"@pinnedNixpkgs@\"@ placeholder that is
+-- already inside Nix string quotes. That is not cosmetic: the loaders these
+-- specs match are compared byte for byte against thunks already on disk, and
+-- the quotes are what @Data.String.Here.Interpolated@ produced when the path
+-- was interpolated at 'Text'. Its @toString@ falls back to @show@ whenever the
+-- interpolated value's type is not the result type, and @FilePath@ never is.
 pinnedNixpkgsPath :: FilePath
 pinnedNixpkgsPath = "/nix/store/qjg458n31xk1l6lj26c3b871d4i4is98-source"
 
@@ -999,7 +1006,7 @@ gitHubThunkSpecV7 =
       let fetch = { private ? false, fetchSubmodules ? false, owner, repo, rev, sha256, ... }:
         if !fetchSubmodules && !private then builtins.fetchTarball {
           url = "https://github.com/${owner}/${repo}/archive/${rev}.tar.gz"; inherit sha256;
-        } else (import @pinnedNixpkgs@ {}).fetchFromGitHub {
+        } else (import "@pinnedNixpkgs@" {}).fetchFromGitHub {
           inherit owner repo rev sha256 fetchSubmodules private;
         };
         json = builtins.fromJSON (builtins.readFile ./github.json);
@@ -1209,7 +1216,7 @@ gitThunkSpecV7 =
         in if !fetchSubmodules && private then builtins.fetchGit {
           url = realUrl; inherit rev;
           ${if branch == null then null else "ref"} = branch;
-        } else (import @pinnedNixpkgs@ {}).fetchgit {
+        } else (import "@pinnedNixpkgs@" {}).fetchgit {
           url = realUrl; inherit rev sha256;
         };
         json = builtins.fromJSON (builtins.readFile ./git.json);
