@@ -9,6 +9,10 @@ jobs:
       NIX_CACHE_URL: ${{ vars.NIX_CACHE_URL }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # release.nix imports dep/style.hs at evaluation time, so the style
+          # checks cannot even be read from a non-recursive clone.
+          submodules: true
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
@@ -17,7 +21,9 @@ jobs:
             extra-trusted-public-keys = hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ= ${{ vars.NIX_CACHE_PUBLIC_KEY }}
       - name: Build
         run: |
-          nix-build release.nix -A command -A byGhc.ghc9122.tests --no-out-link \
+          nix-build release.nix \
+            -A command -A byGhc.ghc9122.tests -A check-hlint -A check-fourmolu \
+            --no-out-link \
             > "$RUNNER_TEMP/nix-build-outputs"
           mapfile -t outputs < "$RUNNER_TEMP/nix-build-outputs"
           nix-store --query --deriver "${outputs[@]}" > "$RUNNER_TEMP/nix-build-derivations"
