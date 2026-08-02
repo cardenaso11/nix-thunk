@@ -381,14 +381,24 @@ renderSourceOnlyFlakeNix srcRef =
 -- | The @flake.nix@ written into an unpacked checkout of a repository that is
 -- not itself a flake, so that a consumer using the thunk as a flake input is
 -- not broken by unpacking it. The checkout is the source, so unlike
--- 'sourceOnlyFlakeNix' there is nothing left to fetch.
+-- 'renderSourceOnlyFlakeNix' there is nothing left to fetch.
+--
+-- @src@ is @sourceInfo@ rather than @outPath@ because that is what the packed
+-- thunk's @src@ is: there it is a @flake = false@ input, and Nix binds such an
+-- input to the fetched tree's attributes. A consumer reading @src.outPath@ or
+-- @src.narHash@ has to keep working across a pack or an unpack, which is the
+-- whole point of writing this file at all.
+--
+-- Whatever this says, @default.nix@ has to recognise byte for byte, so that
+-- 'Nix.Thunk.Internal.thunkSource' can keep it out of an unpacked
+-- dependency's source. Change one and change the other.
 unpackedSourceFlakeNix :: Text
 unpackedSourceFlakeNix =
   """
   # DO NOT HAND-EDIT THIS FILE
   {
     description = "nix-thunk unpacked thunk";
-    outputs = { self }: { src = self.outPath; };
+    outputs = { self }: { src = self.sourceInfo; };
   }
   """
 

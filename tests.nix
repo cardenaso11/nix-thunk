@@ -250,14 +250,19 @@ in
           test -f ~/code/myapp/flake.lock;
           grep -qF 'inherit src' ~/code/myapp/flake.nix;
           grep -qF 'flake = false' ~/code/myapp/flake.nix;
-          nix eval --raw "path:$HOME/code/myapp#src" >/dev/null;
+
+          # `src` is a fetched tree, not a bare path, and stays one whether the
+          # thunk is packed or unpacked.
+          nix eval --raw "path:$HOME/code/myapp#src.outPath" >/dev/null;
+          nix eval --raw "path:$HOME/code/myapp#src.narHash" >/dev/null;
         """)
 
       with subtest("unpacking keeps the flake interface of a non-flake thunk"):
         client.succeed("""
           nix-thunk unpack ~/code/myapp;
           test -f ~/code/myapp/flake.nix;
-          nix eval --raw "path:$HOME/code/myapp#src" >/dev/null;
+          nix eval --raw "path:$HOME/code/myapp#src.outPath" >/dev/null;
+          nix eval --raw "path:$HOME/code/myapp#src.narHash" >/dev/null;
 
           # The generated files must not read as work in progress, or packing
           # would refuse to continue.

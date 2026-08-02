@@ -55,6 +55,58 @@ rec {
           }
           || throw "Thunk at ${toString p} has files in addition to ${name} and optionally default.nix and .attr-cache. Remove either ${name} or those other files to continue (check for leftover .git too)."
         else false;
+
+      # `nix-thunk unpack` writes these into a checkout of a repository that
+      # has no flake of its own, so that anyone consuming the thunk as a flake
+      # input is not broken while it is unpacked. Git is told to ignore them
+      # through .git/info/exclude, which `gitignoreSource` does not read, so
+      # they are dropped here instead: an unpacked dependency has to present
+      # the same source as a packed one.
+      #
+      # Byte for byte what nix-thunk writes, see `Nix.Thunk.Flake`. Matching on
+      # content rather than name is what leaves a flake the repository really
+      # does have alone.
+      generatedFlakeFiles = {
+        "flake.nix" = ''
+          # DO NOT HAND-EDIT THIS FILE
+          {
+            description = "nix-thunk unpacked thunk";
+            outputs = { self }: { src = self.sourceInfo; };
+          }
+        '';
+        "flake.lock" = ''
+          {
+            "nodes": {
+              "root": {}
+            },
+            "root": "root",
+            "version": 7
+          }
+        '';
+      };
+
+      # A final newline is not part of the comparison: nix-thunk writes these
+      # without one, and Nix would put one back if it ever rewrote the lock.
+      sameFile = a: b: lib.removeSuffix "\n" a == lib.removeSuffix "\n" b;
+
+      # Wrapping the caller's source keeps this working whether `gitignoreSource`
+      # hands back a bare path or a filtered source: either way `origSrc` names
+      # the directory the filter sees paths under.
+      unfilteredSource = lib.cleanSourceWith { src = gitignoreSource p; };
+      generatedFlakeFilePaths = builtins.filter
+        (path:
+             builtins.pathExists path
+          && sameFile (builtins.readFile path) generatedFlakeFiles.${baseNameOf path})
+        (map (name: toString unfilteredSource.origSrc + "/" + name)
+             (builtins.attrNames generatedFlakeFiles));
+      unpackedSource =
+        if generatedFlakeFilePaths == []
+        then gitignoreSource p
+        else (lib.cleanSourceWith {
+          inherit (unfilteredSource) name;
+          src = unfilteredSource;
+          filter = path: _: !(builtins.elem (toString path) generatedFlakeFilePaths);
+        }).outPath;
     in
       if isObeliskThunkWithThunkNix then import (p + "/thunk.nix")
       else if hasValidThunk "git.json" then (
@@ -67,7 +119,7 @@ rec {
         pkgs.fetchFromGitHub (filterArgs (builtins.fromJSON (builtins.readFile (p + "/github.json"))))
       else {
         name = baseNameOf p;
-        outPath = gitignoreSource p;
+        outPath = unpackedSource;
       };
 
   #TODO: This really shouldn't include *all* symlinks, just ones that point at directories
