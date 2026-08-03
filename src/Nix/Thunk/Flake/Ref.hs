@@ -20,8 +20,12 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import System.FilePath (isAbsolute, joinPath, splitDirectories, (</>))
 
+--------------------------------------------------------------------------------
+-- Types
+--------------------------------------------------------------------------------
+
 -- | An attribute of a flake reference, e.g. @owner@ or @rev@.
-newtype AttrName = AttrName {unAttrName :: Text}
+newtype AttrName = AttrName { unAttrName :: Text }
   deriving stock (Eq, Ord, Show)
   deriving newtype (Aeson.FromJSON, Aeson.FromJSONKey)
 
@@ -44,21 +48,17 @@ instance Aeson.FromJSON FlakeRefValue where
 -- @{ type = "github"; owner = "NixOS"; repo = "nixpkgs"; rev = "..."; }@.
 -- Attribute-set form is preferred over URL form so that no escaping or
 -- query-string assembly is needed.
-newtype FlakeRef = FlakeRef {unFlakeRef :: Map AttrName FlakeRefValue}
+newtype FlakeRef = FlakeRef { unFlakeRef :: Map AttrName FlakeRefValue }
   deriving stock (Eq, Ord, Show)
   deriving newtype (Aeson.FromJSON)
 
 -- | A reference carrying only what says how to fetch it, which is what a flake
 -- declares and what a lock records as @original@.
 --
--- A refinement of 'FlakeRef' in the same spirit as
--- 'Nix.Thunk.Flake.Name.FlakeId' is one of 'Nix.Thunk.Flake.Name.InputName',
--- with one difference worth knowing: the rule a @FlakeId@ keeps is Nix's, and
--- breaking it gets you an error, while the rule here is ours, and breaking it
--- gets you a lock that looks fine.
+-- A refinement of 'FlakeRef'
 --
 -- 'fetchableRef' is the way in and 'mapFetchableRef' the way to change one.
-newtype FetchableRef = FetchableRef {unFetchableRef :: FlakeRef}
+newtype FetchableRef = FetchableRef { unFetchableRef :: FlakeRef }
   deriving stock (Eq, Ord, Show)
 
 -- | The two references a lock records for one input: the one the flake
@@ -77,6 +77,10 @@ data NodeRefs = NodeRefs
   , nodeRefs_locked :: FlakeRef
   }
   deriving stock (Eq, Show)
+
+--------------------------------------------------------------------------------
+-- Node references
+--------------------------------------------------------------------------------
 
 -- | The references a lock records for the repository a thunk points at.
 --
@@ -109,7 +113,7 @@ sourceNodeRefs srcRef discovered =
 -- what this node resolves to, hashes included.
 fetchableNodeRefs :: FlakeRef -> Maybe NodeRefs
 fetchableNodeRefs locked = do
-  guard $ refString typeAttr locked /= Just "path"
+  guard $ not $ isPathRef locked
   pure
     NodeRefs
       { nodeRefs_original = fetchableRef locked
@@ -125,6 +129,10 @@ withRelativeDirRefs parent rel =
     <$> mapFetchableRef (`withRelativeDir` rel) parent.nodeRefs_original
     <*> withRelativeDir parent.nodeRefs_locked rel
 
+--------------------------------------------------------------------------------
+-- Relative paths
+--------------------------------------------------------------------------------
+
 -- | The relative path a reference was declared with, if it was declared as
 -- one. References like this are why a parent has to be tracked: the lock
 -- records their locked form as a bare store path, which is useless to anyone
@@ -139,7 +147,7 @@ withRelativeDirRefs parent rel =
 -- relative to nothing anybody else can name.
 relativePathOf :: FlakeRef -> Maybe FilePath
 relativePathOf orig = do
-  guard $ refString typeAttr orig == Just "path"
+  guard $ isPathRef orig
   relPath <- T.unpack <$> refString pathAttr orig
   guard $ not $ isAbsolute relPath
   pure relPath
@@ -168,25 +176,6 @@ setRefDir dir (FlakeRef attrs) =
       then Map.delete dirAttr attrs
       else Map.insert dirAttr (FlakeRefValue_String $ T.pack dir) attrs
 
-dirAttr :: AttrName
-dirAttr = AttrName "dir"
-
--- | One attribute of a reference, when it is a string.
---
--- Every attribute this package reads back off a reference is one, and every
--- one of them wants the same answer to "absent, or present but not a string":
--- no.
-refString :: AttrName -> FlakeRef -> Maybe Text
-refString name flakeRef = case Map.lookup name $ unFlakeRef flakeRef of
-  Just (FlakeRefValue_String s) -> Just s
-  _ -> Nothing
-
-typeAttr :: AttrName
-typeAttr = AttrName "type"
-
-pathAttr :: AttrName
-pathAttr = AttrName "path"
-
 -- | Collapse @.@ and @..@ segments. 'Nothing' when the path climbs out of the
 -- tree it started in, which cannot be expressed as a subdirectory of a repo.
 normaliseRelative :: FilePath -> Maybe FilePath
@@ -200,6 +189,40 @@ normaliseRelative = fmap (joinPath . reverse) . foldM step [] . splitDirectories
         [] -> Nothing
         _innermost : outer -> Just outer
       seg -> Just $ seg : acc
+
+--------------------------------------------------------------------------------
+-- Reference attributes
+--------------------------------------------------------------------------------
+
+-- | One attribute of a reference, when it is a string.
+--
+-- Every attribute this package reads back off a reference is one, and every
+-- one of them wants the same answer to "absent, or present but not a string":
+-- no.
+refString :: AttrName -> FlakeRef -> Maybe Text
+refString name flakeRef = case Map.lookup name $ unFlakeRef flakeRef of
+  Just (FlakeRefValue_String s) -> Just s
+  _ -> Nothing
+
+-- | Whether a reference is a @path@ one. The two callers take opposite sides
+-- of it, 'fetchableNodeRefs' refusing these and 'relativePathOf' considering
+-- nothing else, which is why the rule has a name rather than being spelled at
+-- each.
+isPathRef :: FlakeRef -> Bool
+isPathRef flakeRef = refString typeAttr flakeRef == Just "path"
+
+typeAttr :: AttrName
+typeAttr = AttrName "type"
+
+pathAttr :: AttrName
+pathAttr = AttrName "path"
+
+dirAttr :: AttrName
+dirAttr = AttrName "dir"
+
+--------------------------------------------------------------------------------
+-- Fetchable references
+--------------------------------------------------------------------------------
 
 -- | Keep only the attributes of a locked node that describe /how to fetch it/,
 -- and so are meaningful when copied into an input. Everything else a lock

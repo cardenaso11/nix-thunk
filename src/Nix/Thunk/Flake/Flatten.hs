@@ -18,13 +18,17 @@ module Nix.Thunk.Flake.Flatten where
 import Data.Foldable (toList)
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
 import Nix.Thunk.Flake.Name
 import Nix.Thunk.Flake.Ref
 import Nix.Thunk.Flake.Upstream
+
+--------------------------------------------------------------------------------
+-- Types
+--------------------------------------------------------------------------------
 
 -- | The generated flake as a value: everything the renderers need, and nothing
 -- about how any of it is spelled.
@@ -107,17 +111,14 @@ data FlattenContext = FlattenContext
   , flattenContext_names :: Map NodeId FlakeId
   }
 
+--------------------------------------------------------------------------------
+-- Flattening
+--------------------------------------------------------------------------------
+
 -- | Flatten upstream's lock graph into the inputs of the thunk's own flake.
 --
 -- A function of its two arguments and nothing else, which is what makes the
 -- translation testable: hand it a lock, read the result.
---
--- 'flattenedFlake_inputs' reads inside out. 'nonRootNodes' is every node but
--- the root, keyed by node id; 'flattenedInput' decides what to do with each
--- one; 'inputNameOf' rekeys the lot to the names consumers write. The union
--- with 'rootAliases' is left-biased, so a node always beats an alias of the
--- same name. 'nodeInputNames' reserves the alias names, so that should never
--- come up, but it costs nothing to make the safe case the default.
 --
 -- 'flattenedFlake_complete' walks every node of the lock rather than
 -- 'nonRootNodes', because the root's edges are 'flattenedFlake_sourceEdges'
@@ -133,17 +134,28 @@ flattenLock srcRefs lock =
     { flattenedFlake_sourceName = ctx.flattenContext_sourceName
     , flattenedFlake_sourceRefs = ctx.flattenContext_sourceRefs
     , flattenedFlake_sourceEdges = overridableEdges ctx $ rootEdges lock
-    , flattenedFlake_inputs =
-        Map.union
-          ( Map.mapKeys (inputNameOf ctx) $
-              Map.mapMaybeWithKey (flattenedInput ctx) $
-                nonRootNodes lock
-          )
-          (aliasInput <$> rootAliases ctx)
+    , flattenedFlake_inputs = flattenedInputs ctx
     , flattenedFlake_complete = all (edgesFullyDeclared ctx) $ Map.keys lock.flakeLock_nodes
     }
   where
     ctx = flattenContext srcRefs lock
+
+-- | Every root-level input the generated flake binds for upstream.
+--
+-- Reads inside out. 'nonRootNodes' is every node but the root, keyed by node
+-- id; 'flattenedInput' decides what to do with each one; 'inputNameOf' rekeys
+-- the lot to the names consumers write. The union with 'rootAliases' is
+-- left-biased, so a node always beats an alias of the same name.
+-- 'nodeInputNames' reserves the alias names, so that should never come up,
+-- but it costs nothing to make the safe case the default.
+flattenedInputs :: FlattenContext -> Map FlakeId FlattenedInput
+flattenedInputs ctx =
+  Map.union
+    ( Map.mapKeys (inputNameOf ctx) $
+        Map.mapMaybeWithKey (flattenedInput ctx) $
+          nonRootNodes ctx.flattenContext_lock
+    )
+    (aliasInput <$> rootAliases ctx)
 
 -- | Whether the generated flake declares every input a node of upstream's lock
 -- declares.
@@ -216,82 +228,7 @@ aliasInput target =
 overridableEdges :: FlattenContext -> Map InputName NodeId -> Map InputName FlakeId
 overridableEdges ctx = fmap (inputNameOf ctx) . Map.filterWithKey overridable
   where
-    overridable edgeName target = isJust (flakeId edgeName) && nodeHasRef ctx target
-
-inputNameOf :: FlattenContext -> NodeId -> FlakeId
-inputNameOf ctx nodeId =
-  fromMaybe (toFlakeId $ nodeIdToInputName nodeId) $ Map.lookup nodeId ctx.flattenContext_names
-
--- | The name each node is exposed under.
---
--- A lock node id is not an input name. Nix disambiguates node ids with @_2@
--- and @_3@ suffixes as it walks the graph, so upstream's own @nixpkgs@ is
--- frequently keyed @nixpkgs_2@ while some transitive dependency claims the
--- plain key. Exposing node ids would therefore bind @mythunk\/nixpkgs@ to the
--- wrong flake, and would retarget it whenever upstream's input set changes.
--- Upstream's root inputs are named as upstream named them; anything reachable
--- only transitively keeps its node id, with collisions suffixed. Either way the
--- name has to be one Nix can refer to, so 'toFlakeId' has the last word.
-nodeInputNames :: FlakeLock -> Map NodeId FlakeId
-nodeInputNames lock = nameNodes reserved (rootInputNames lock) $ preferNodeId <$> Map.keys (nonRootNodes lock)
-  where
-    -- Every name upstream bound at its root is reserved, including the ones
-    -- 'rootInputNames' had to drop: 'rootAliases' will claim those, and a
-    -- transitive node must not be given a name an alias is about to take.
-    reserved = Set.fromList $ toFlakeId <$> Map.keys (rootEdges lock)
-    preferNodeId nodeId = (nodeId, nodeIdToInputName nodeId)
-
--- | The name each node upstream binds at its root is exposed under. A node
--- bound more than once, which a root-level @follows@ does, keeps the first of
--- those names.
---
--- Nothing is reserved here, unlike in 'nodeInputNames': the names these nodes
--- are competing for are the very ones being handed out.
-rootInputNames :: FlakeLock -> Map NodeId FlakeId
-rootInputNames lock = nameNodes Set.empty Map.empty $ preferEdgeName <$> Map.toList (rootEdges lock)
-  where
-    preferEdgeName (edgeName, target) = (target, edgeName)
-
--- | Give each node the first name offered for it.
---
--- A node named already keeps the name it has, which is what makes "first"
--- mean anything: the callers offer names in ascending order, so it is the
--- alphabetically first. Arbitrary, but the answer ends up in a committed file,
--- so it has to be the same answer every time.
---
--- What is left of a name after 'toFlakeId' can collide with one already given
--- out, and 'freshInputName' suffixes the loser. The set of names already taken
--- is recomputed each step, which is quadratic and does not matter: locks have
--- tens of nodes.
-nameNodes
-  :: Set FlakeId
-  -- ^ Names spoken for by something other than a node
-  -> Map NodeId FlakeId
-  -- ^ Names given out already
-  -> [(NodeId, InputName)]
-  -- ^ Each node, and the name it would like, as upstream spelled it
-  -> Map NodeId FlakeId
-nameNodes reserved = foldl' name
-  where
-    name acc (nodeId, preferred)
-      | Map.member nodeId acc = acc
-      | otherwise =
-          Map.insert
-            nodeId
-            (freshInputName (reserved <> Set.fromList (toList acc)) $ toFlakeId preferred)
-            acc
-
--- | The name the thunk's own source is bound to. Upstream's inputs occupy
--- root-level names too, so on the off chance one of them is already called
--- @upstream@, pick another name rather than colliding.
-sourceInputName :: Set FlakeId -> FlakeId
-sourceInputName taken = freshInputName taken $ toFlakeId $ InputName "upstream"
-
--- | Every root-level name the generated flake binds for upstream: the name
--- each node is exposed under, plus the alias names upstream also used.
-takenInputNames :: FlakeLock -> Map NodeId FlakeId -> Set FlakeId
-takenInputNames lock names =
-  Set.fromList (toFlakeId <$> Map.keys (rootEdges lock)) <> Set.fromList (toList names)
+    overridable edgeName target = isFlakeId edgeName && nodeHasRef ctx target
 
 -- | Ties the knot between the context and the references it computes.
 --
@@ -374,3 +311,88 @@ aliasPath ctx nodeId = do
   origin <- Map.lookup nodeId ctx.flattenContext_origins
   steps <- traverse flakeId origin.nodeOrigin_path
   pure $ FollowsPath $ ctx.flattenContext_sourceName : steps
+
+--------------------------------------------------------------------------------
+-- Names
+--------------------------------------------------------------------------------
+
+inputNameOf :: FlattenContext -> NodeId -> FlakeId
+inputNameOf ctx nodeId =
+  fromMaybe (toFlakeId $ nodeIdToInputName nodeId) $ Map.lookup nodeId ctx.flattenContext_names
+
+-- | The name each node is exposed under.
+--
+-- A lock node id is not an input name. Nix disambiguates node ids with @_2@
+-- and @_3@ suffixes as it walks the graph, so upstream's own @nixpkgs@ is
+-- frequently keyed @nixpkgs_2@ while some transitive dependency claims the
+-- plain key. Exposing node ids would therefore bind @mythunk\/nixpkgs@ to the
+-- wrong flake, and would retarget it whenever upstream's input set changes.
+-- Upstream's root inputs are named as upstream named them; anything reachable
+-- only transitively keeps its node id, with collisions suffixed. Either way the
+-- name has to be one Nix can refer to, so 'toFlakeId' has the last word.
+nodeInputNames :: FlakeLock -> Map NodeId FlakeId
+nodeInputNames lock = nameNodes reserved (rootInputNames lock) $ preferNodeId <$> Map.keys (nonRootNodes lock)
+  where
+    -- Every name upstream bound at its root is reserved, including the ones
+    -- 'rootInputNames' had to drop: 'rootAliases' will claim those, and a
+    -- transitive node must not be given a name an alias is about to take.
+    reserved = rootBoundNames lock
+    preferNodeId nodeId = (nodeId, nodeIdToInputName nodeId)
+
+-- | The name each node upstream binds at its root is exposed under. A node
+-- bound more than once, which a root-level @follows@ does, keeps the first of
+-- those names.
+--
+-- Nothing is reserved here, unlike in 'nodeInputNames': the names these nodes
+-- are competing for are the very ones being handed out.
+rootInputNames :: FlakeLock -> Map NodeId FlakeId
+rootInputNames lock = nameNodes Set.empty Map.empty $ preferEdgeName <$> Map.toList (rootEdges lock)
+  where
+    preferEdgeName (edgeName, target) = (target, edgeName)
+
+-- | Give each node the first name offered for it.
+--
+-- A node named already keeps the name it has, which is what makes "first"
+-- mean anything: the callers offer names in ascending order, so it is the
+-- alphabetically first. Arbitrary, but the answer ends up in a committed file,
+-- so it has to be the same answer every time.
+--
+-- What is left of a name after 'toFlakeId' can collide with one already given
+-- out, and 'freshInputName' suffixes the loser. The set of names already taken
+-- is recomputed each step, which is quadratic and does not matter: locks have
+-- tens of nodes.
+nameNodes
+  :: Set FlakeId
+  -- ^ Names spoken for by something other than a node
+  -> Map NodeId FlakeId
+  -- ^ Names given out already
+  -> [(NodeId, InputName)]
+  -- ^ Each node, and the name it would like, as upstream spelled it
+  -> Map NodeId FlakeId
+nameNodes reserved = foldl' name
+  where
+    name acc (nodeId, preferred)
+      | Map.member nodeId acc = acc
+      | otherwise =
+          Map.insert
+            nodeId
+            (freshInputName (reserved <> Set.fromList (toList acc)) $ toFlakeId preferred)
+            acc
+
+-- | The name the thunk's own source is bound to. Upstream's inputs occupy
+-- root-level names too, so on the off chance one of them is already called
+-- @upstream@, pick another name rather than colliding.
+sourceInputName :: Set FlakeId -> FlakeId
+sourceInputName taken = freshInputName taken $ toFlakeId $ InputName "upstream"
+
+-- | Every root-level name the generated flake binds for upstream: the name
+-- each node is exposed under, plus the alias names upstream also used.
+takenInputNames :: FlakeLock -> Map NodeId FlakeId -> Set FlakeId
+takenInputNames lock names = rootBoundNames lock <> Set.fromList (toList names)
+
+-- | What each name upstream bound at its root comes out as, whether the node
+-- keeps it or an alias claims it. One set consulted from both sides:
+-- 'nodeInputNames' holds these back from the transitive nodes, and
+-- 'takenInputNames' counts them against the source's own name.
+rootBoundNames :: FlakeLock -> Set FlakeId
+rootBoundNames lock = Set.fromList $ toFlakeId <$> Map.keys (rootEdges lock)

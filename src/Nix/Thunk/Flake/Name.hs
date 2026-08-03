@@ -19,12 +19,16 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 
+--------------------------------------------------------------------------------
+-- Types
+--------------------------------------------------------------------------------
+
 -- | The name an input is bound to, either as an edge label within a lock or as
 -- a root-level input of the flake being generated.
 --
 -- Whatever a flake called something. Nix accepts any attribute name here, so
 -- this is the unconstrained end: see 'FlakeId' for the other.
-newtype InputName = InputName {unInputName :: Text}
+newtype InputName = InputName { unInputName :: Text }
   deriving stock (Eq, Ord, Show)
   deriving newtype (Aeson.FromJSON, Aeson.FromJSONKey)
 
@@ -37,7 +41,7 @@ newtype InputName = InputName {unInputName :: Text}
 -- Nix does not require this of a name being /declared/, which is how upstream
 -- comes to have inputs nobody can refer to: haskell.nix has fourteen,
 -- including @hls-1.10@.
-newtype FlakeId = FlakeId {flakeIdName :: InputName}
+newtype FlakeId = FlakeId { flakeIdName :: InputName }
   deriving stock (Eq, Ord, Show)
 
 -- | A @follows@ target: a sequence of input names walked from the root node.
@@ -46,7 +50,7 @@ newtype FlakeId = FlakeId {flakeIdName :: InputName}
 -- read out of upstream's lock is 'InputName's, taken as we find them. A path
 -- we write is 'FlakeId's, since Nix will parse it back as identifiers, and
 -- building one out of anything else is the mistake this is here to prevent.
-newtype FollowsPath name = FollowsPath {unFollowsPath :: [name]}
+newtype FollowsPath name = FollowsPath { unFollowsPath :: [name] }
   deriving stock (Eq, Ord, Show)
   deriving newtype (Aeson.FromJSON)
 
@@ -65,6 +69,10 @@ instance IsInputName InputName where
 instance IsInputName FlakeId where
   inputName = flakeIdName
 
+--------------------------------------------------------------------------------
+-- Flake identifiers
+--------------------------------------------------------------------------------
+
 -- | The name as it stands, when Nix will accept it, and 'Nothing' when it will
 -- not.
 --
@@ -72,9 +80,9 @@ instance IsInputName FlakeId where
 -- name has to be reproduced exactly, as an override attribute path does, this
 -- failing is the end of the matter and the edge gets dropped.
 flakeId :: InputName -> Maybe FlakeId
-flakeId name = case T.uncons $ unInputName name of
-  Just (leading, rest) | isFlakeIdStart leading && T.all isFlakeIdChar rest -> Just $ FlakeId name
-  _ -> Nothing
+flakeId name
+  | isFlakeId name = Just $ FlakeId name
+  | otherwise = Nothing
 
 -- | The nearest name to this one that Nix will accept.
 --
@@ -100,17 +108,33 @@ toFlakeId name = fromMaybe (FlakeId sanitised) $ flakeId name
     leadingLetter = if maybe False (isFlakeIdStart . fst) (T.uncons text) then "" else "input-"
     keepOrReplace c = if isFlakeIdChar c then c else '_'
 
--- | The name a thunk of a repository that is not a flake gives its one input.
-sourceOnlyInputName :: FlakeId
-sourceOnlyInputName = toFlakeId $ InputName "src"
+-- | The rule itself, for a caller that only needs the answer. 'flakeId' is
+-- this plus the evidence.
+isFlakeId :: InputName -> Bool
+isFlakeId name = case T.uncons $ unInputName name of
+  Just (leading, rest) -> isFlakeIdStart leading && T.all isFlakeIdChar rest
+  Nothing -> False
 
 -- | Nix's rule is @[a-zA-Z]@, so the 'isAscii' guard is doing work: 'isAlpha'
 -- is true of @é@ and Nix's parser is not.
 isFlakeIdStart :: Char -> Bool
-isFlakeIdStart c = isAscii c && isAlpha c
+isFlakeIdStart c =
+  and
+    [ isAscii c
+    , isAlpha c
+    ]
 
 isFlakeIdChar :: Char -> Bool
-isFlakeIdChar c = isFlakeIdStart c || (isAscii c && isDigit c) || c == '_' || c == '-'
+isFlakeIdChar c =
+  or
+    [ isFlakeIdStart c
+    , and
+        [ isAscii c
+        , isDigit c
+        ]
+    , c == '_'
+    , c == '-'
+    ]
 
 -- | Suffix a name until it is one nobody has taken. A suffixed identifier is
 -- still an identifier, so this cannot leave the refinement.
@@ -123,7 +147,15 @@ freshInputName taken base = go (0 :: Int)
       where
         candidate
           | n == 0 = base
-          | otherwise = FlakeId $ InputName $ unInputName (inputName base) <> "_" <> T.pack (show $ n + 1)
+          | otherwise = FlakeId $ InputName $ nameText base <> "_" <> T.pack (show $ n + 1)
+
+-- | The name a thunk of a repository that is not a flake gives its one input.
+sourceOnlyInputName :: FlakeId
+sourceOnlyInputName = toFlakeId $ InputName "src"
+
+--------------------------------------------------------------------------------
+-- Names as text
+--------------------------------------------------------------------------------
 
 -- | A name as text, for the places that are about to quote or encode it. This
 -- and its two callers are all 'IsInputName' earns: a handful of leaves that do

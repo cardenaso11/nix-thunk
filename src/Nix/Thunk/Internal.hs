@@ -732,7 +732,9 @@ createThunkWithSpec target spec mPtr = do
 specHasFlakeFiles :: ThunkSpec -> Bool
 specHasFlakeFiles = any isGenerated . _thunkSpec_files
   where
-    isGenerated = \case ThunkFileSpec_Generated _ -> True; _ -> False
+    isGenerated = \case
+      ThunkFileSpec_Generated _ -> True
+      _ -> False
 
 -- | Generate the flake files of a packed thunk.
 writeThunkFlakeFiles :: MonadNixThunk m => FilePath -> ThunkPtr -> m ()
@@ -740,29 +742,38 @@ writeThunkFlakeFiles target ptr = do
   let srcRef = thunkPtrToFlakeRef ptr
   fetched <- fetchFlakeRef srcRef
   let srcRefs = Flake.sourceNodeRefs srcRef $ _fetchedFlakeRef_locked fetched
-  liftIO (doesFileExist $ _fetchedFlakeRef_outPath fetched </> flakeNixFileName) >>= \case
-    False -> do
-      liftIO $ do
-        writeUtf8File (target </> flakeNixFileName) $ Flake.renderSourceOnlyFlakeNix srcRef
-        LBS.writeFile (target </> flakeLockFileName) $ Flake.renderSourceOnlyFlakeLock srcRefs
-      lockThunkFlake target
+  liftIO (doesFileExist $ flakeNixPath $ _fetchedFlakeRef_outPath fetched) >>= \case
+    False -> writeSourceOnlyFlakeFiles target srcRef srcRefs
     True -> do
       lock <- upstreamFlakeLock $ _fetchedFlakeRef_outPath fetched
-      let flattened = Flake.flattenLock srcRefs lock
-      liftIO $ writeUtf8File (target </> flakeNixFileName) $ Flake.renderFlakeNix flattened
-      -- Upstream's lock already answers what every input of the generated
-      -- flake resolves to, so the thunk's own lock is written from it rather
-      -- than left for Nix to work out one input at a time. When the generated
-      -- flake left something for upstream's lock to settle, it is not this file
-      -- that says what the inputs are, and there is nothing to write.
-      if Flake.flattenedFlake_complete flattened
-        then liftIO $ LBS.writeFile (target </> flakeLockFileName) $ Flake.renderFlakeLock flattened
-        else
-          putLog Debug $
-            "Some inputs of "
-              <> T.pack target
-              <> " could not be restated, so locking it has to resolve them."
-      lockThunkFlake target
+      writeFlattenedFlakeFiles target $ Flake.flattenLock srcRefs lock
+
+-- | The flake files of a thunk whose upstream is not itself a flake: nothing
+-- to flatten, so the flake exposes the fetched source and nothing else.
+writeSourceOnlyFlakeFiles :: MonadNixThunk m => FilePath -> Flake.FlakeRef -> Flake.NodeRefs -> m ()
+writeSourceOnlyFlakeFiles target srcRef srcRefs = do
+  liftIO $ do
+    writeUtf8File (flakeNixPath target) $ Flake.renderSourceOnlyFlakeNix srcRef
+    LBS.writeFile (flakeLockPath target) $ Flake.renderSourceOnlyFlakeLock srcRefs
+  lockThunkFlake target
+
+-- | The flake files of a thunk whose upstream is a flake.
+writeFlattenedFlakeFiles :: MonadNixThunk m => FilePath -> Flake.FlattenedFlake -> m ()
+writeFlattenedFlakeFiles target flattened = do
+  liftIO $ writeUtf8File (flakeNixPath target) $ Flake.renderFlakeNix flattened
+  -- Upstream's lock already answers what every input of the generated
+  -- flake resolves to, so the thunk's own lock is written from it rather
+  -- than left for Nix to work out one input at a time. When the generated
+  -- flake left something for upstream's lock to settle, it is not this file
+  -- that says what the inputs are, and there is nothing to write.
+  if Flake.flattenedFlake_complete flattened
+    then liftIO $ LBS.writeFile (flakeLockPath target) $ Flake.renderFlakeLock flattened
+    else
+      putLog Debug $
+        "Some inputs of "
+          <> T.pack target
+          <> " could not be restated, so locking it has to resolve them."
+  lockThunkFlake target
 
 -- | Have Nix lock the generated flake.
 --
@@ -774,9 +785,9 @@ writeThunkFlakeFiles target ptr = do
 -- somebody depended on it.
 lockThunkFlake :: MonadNixThunk m => FilePath -> m ()
 lockThunkFlake target = do
-  before <- liftIO $ readFileMaybe $ target </> flakeLockFileName
+  before <- liftIO $ readFileMaybe $ flakeLockPath target
   nixFlakeLock target
-  after <- liftIO $ readFileMaybe $ target </> flakeLockFileName
+  after <- liftIO $ readFileMaybe $ flakeLockPath target
   when (isJust before && before /= after) $
     putLog Warning $
       "The lock written for "
@@ -806,24 +817,30 @@ instance Aeson.FromJSON FetchedFlakeRef where
 -- to use the thunk. The revision is pinned, so the fetch is cached.
 fetchFlakeRef :: MonadNixThunk m => Flake.FlakeRef -> m FetchedFlakeRef
 fetchFlakeRef srcRef = do
-  -- The store path is reported as @path@ rather than @outPath@ on purpose:
-  -- @toJSON@ of an attribute set carrying an @outPath@ coerces the whole set
-  -- to that string, exactly as @toString@ would, and the rest of the object
-  -- would be lost.
-  let expr =
-        "let tree = builtins.fetchTree "
-          <> Flake.renderFlakeRefExpr srcRef
-          <> "; in builtins.toJSON { path = tree.outPath; locked = builtins.intersectAttrs "
-          <> lockedAttrsExpr
-          <> " tree; }"
   out <-
     withExitFailMessage ("nix eval: Failed to fetch " <> Flake.renderFlakeRefExpr srcRef) $
-      readProcessAndLogStderr Debug $
-        Cli.proc nixExePath $
-          flakeArgs <> ["eval", "--impure", "--raw", "--expr", T.unpack expr]
+      readProcessQuietly $
+        nixProc $
+          fetchFlakeRefArgs srcRef
   case Aeson.eitherDecodeStrict $ encodeUtf8 $ T.strip out of
     Left e -> failWith $ "Could not read what fetching " <> Flake.renderFlakeRefExpr srcRef <> " produced:\n" <> T.pack e
     Right fetched -> pure fetched
+
+fetchFlakeRefArgs :: Flake.FlakeRef -> [String]
+fetchFlakeRefArgs srcRef = ["eval", "--impure", "--raw", "--expr", T.unpack $ fetchTreeExpr srcRef]
+
+-- | The expression that fetches a reference and reports what a lock records
+-- about it. The store path is reported as @path@ rather than @outPath@ on
+-- purpose: @toJSON@ of an attribute set carrying an @outPath@ coerces the
+-- whole set to that string, exactly as @toString@ would, and the rest of the
+-- object would be lost.
+fetchTreeExpr :: Flake.FlakeRef -> Text
+fetchTreeExpr srcRef =
+  "let tree = builtins.fetchTree "
+    <> Flake.renderFlakeRefExpr srcRef
+    <> "; in builtins.toJSON { path = tree.outPath; locked = builtins.intersectAttrs "
+    <> lockedAttrsExpr
+    <> " tree; }"
 
 -- | The attributes of a fetched tree that belong in a lock. The rest of what
 -- @fetchTree@ returns is either the tree itself or a restatement of these.
@@ -835,7 +852,7 @@ lockedAttrsExpr = "{ lastModified = null; narHash = null; rev = null; revCount =
 -- to resolving its inputs here and now.
 upstreamFlakeLock :: MonadNixThunk m => FilePath -> m Flake.FlakeLock
 upstreamFlakeLock srcPath = do
-  stored <- liftIO $ try @IOError $ BSC.readFile $ srcPath </> flakeLockFileName
+  stored <- liftIO $ try @IOError $ BSC.readFile $ flakeLockPath srcPath
   case stored of
     Right bytes -> either unparseable pure $ Aeson.eitherDecodeStrict bytes
     Left e
@@ -870,20 +887,22 @@ nixFlakeMetadata :: MonadNixThunk m => FilePath -> m FlakeMetadata
 nixFlakeMetadata srcPath = do
   out <-
     withExitFailMessage ("nix flake metadata: Failed to resolve the inputs of " <> T.pack srcPath) $
-      readProcessAndLogStderr Debug $
-        Cli.proc nixExePath $
-          flakeArgs
-            <> ["flake", "metadata", "--json", "--no-write-lock-file", flakePathRef srcPath]
+      readProcessQuietly $
+        nixProc $
+          nixFlakeMetadataArgs srcPath
   case Aeson.eitherDecodeStrict $ encodeUtf8 out of
     Right v -> pure v
     Left e -> failWith $ "nix flake metadata: unrecognized output:\n" <> T.pack e
 
+nixFlakeMetadataArgs :: FilePath -> [String]
+nixFlakeMetadataArgs srcPath = ["flake", "metadata", "--json", "--no-write-lock-file", flakePathRef srcPath]
+
 nixFlakeLock :: MonadNixThunk m => FilePath -> m ()
 nixFlakeLock target =
   withExitFailMessage failureMessage $
-    callProcessAndLogOutput (Debug, Debug) $
-      Cli.proc nixExePath $
-        flakeArgs <> ["flake", "lock", flakePathRef target]
+    callProcessQuietly $
+      nixProc $
+        nixFlakeLockArgs target
   where
     -- Locking resolves every input the generated flake declares, which is one
     -- per node of upstream's own lock, so this is where an upstream pin that
@@ -894,6 +913,27 @@ nixFlakeLock target =
         <> T.pack target
         <> ".\nLocking has to resolve every input of the repository this thunk"
         <> " points at, so this fails if any of them is unreachable from here."
+
+nixFlakeLockArgs :: FilePath -> [String]
+nixFlakeLockArgs target = ["flake", "lock", flakePathRef target]
+
+-- | Capture a process's stdout. Its stderr goes to the log at 'Debug', since
+-- the nix family of tools narrates progress there even when nothing is wrong.
+readProcessQuietly :: MonadNixThunk m => ProcessSpec -> m Text
+readProcessQuietly = readProcessAndLogStderr Debug
+
+-- | Run a process for its effect, with both of its streams going to the log
+-- at 'Debug', for the same reason as 'readProcessQuietly'.
+callProcessQuietly :: MonadNixThunk m => ProcessSpec -> m ()
+callProcessQuietly = callProcessAndLogOutput (Debug, Debug)
+
+-- | A nix invocation with the flake features enabled, which every command the
+-- flake files need is behind.
+nixProc :: [String] -> ProcessSpec
+nixProc args = nixRawProc $ flakeArgs <> args
+
+nixRawProc :: [String] -> ProcessSpec
+nixRawProc = Cli.proc nixExePath
 
 -- | Packing a thunk should not depend on how the user has configured Nix, so
 -- the features these commands need are requested explicitly.
@@ -921,35 +961,47 @@ nixExePath = $(staticWhich "nix")
 thunkPtrToFlakeRef :: ThunkPtr -> Flake.FlakeRef
 thunkPtrToFlakeRef (ThunkPtr rev src) = case src of
   ThunkSource_GitHub s
-    | _gitHubSource_private s -> gitRef $ forgetGithub True s
-    -- No @ref@: the @github@ fetcher rejects a reference carrying both a
-    -- revision and a branch, and the revision alone identifies the tree,
-    -- since GitHub serves an archive of any revision regardless of branch.
-    | otherwise ->
-        flakeRef
-          [ ("type", str "github")
-          , ("owner", str $ untagName $ _gitHubSource_owner s)
-          , ("repo", str $ untagName $ _gitHubSource_repo s)
-          , ("rev", str commit)
-          ]
-  ThunkSource_Git s -> gitRef s
-  where
-    commit = T.pack $ refToHexString $ _thunkRev_commit rev
-    str = Flake.FlakeRefValue_String
-    flakeRef = Flake.FlakeRef . Map.fromList . fmap (first Flake.AttrName)
-    gitRef s =
-      flakeRef $
-        catMaybes
-          [ Just ("type", str "git")
-          , Just ("url", str $ flakeUriToText $ _gitSource_url s)
-          , Just ("rev", str commit)
-          , Just $ case _gitSource_branch s of
-              Just b -> ("ref", str $ untagName b)
-              -- Without a branch the revision need not be reachable from the
-              -- default one, exactly as in the v9 loader's `allRefs = branch == null`.
-              Nothing -> ("allRefs", Flake.FlakeRefValue_Bool True)
-          , ("submodules", Flake.FlakeRefValue_Bool True) <$ guard (_gitSource_fetchSubmodules s)
-          ]
+    | _gitHubSource_private s -> gitRef rev $ forgetGithub True s
+    | otherwise -> githubRef rev s
+  ThunkSource_Git s -> gitRef rev s
+
+-- | The @github@ form of a thunk's reference. It carries no @ref@: the
+-- @github@ fetcher rejects a reference carrying both a revision and a branch,
+-- and the revision alone identifies the tree, since GitHub serves an archive
+-- of any revision regardless of branch.
+githubRef :: ThunkRev -> GitHubSource -> Flake.FlakeRef
+githubRef rev s =
+  flakeRef
+    [ ("type", flakeRefStr "github")
+    , ("owner", flakeRefStr $ untagName $ _gitHubSource_owner s)
+    , ("repo", flakeRefStr $ untagName $ _gitHubSource_repo s)
+    , ("rev", flakeRefStr $ commitText rev)
+    ]
+
+-- | The @git@ form of a thunk's reference.
+gitRef :: ThunkRev -> GitSource -> Flake.FlakeRef
+gitRef rev s =
+  flakeRef $
+    catMaybes
+      [ Just ("type", flakeRefStr "git")
+      , Just ("url", flakeRefStr $ flakeUriToText $ _gitSource_url s)
+      , Just ("rev", flakeRefStr $ commitText rev)
+      , Just $ case _gitSource_branch s of
+          Just b -> ("ref", flakeRefStr $ untagName b)
+          -- Without a branch the revision need not be reachable from the
+          -- default one, exactly as in the v9 loader's `allRefs = branch == null`.
+          Nothing -> ("allRefs", Flake.FlakeRefValue_Bool True)
+      , ("submodules", Flake.FlakeRefValue_Bool True) <$ guard (_gitSource_fetchSubmodules s)
+      ]
+
+flakeRef :: [(Text, Flake.FlakeRefValue)] -> Flake.FlakeRef
+flakeRef = Flake.FlakeRef . Map.fromList . fmap (first Flake.AttrName)
+
+flakeRefStr :: Text -> Flake.FlakeRefValue
+flakeRefStr = Flake.FlakeRefValue_String
+
+commitText :: ThunkRev -> Text
+commitText rev = T.pack $ refToHexString $ _thunkRev_commit rev
 
 updateThunkToLatest :: MonadNixThunk m => ThunkUpdateConfig -> FilePath -> m ()
 updateThunkToLatest cfg target = do
@@ -1430,6 +1482,12 @@ mkFlakeThunkSpec name jsonFileName parser srcNix =
                ]
        }
 
+flakeNixPath :: FilePath -> FilePath
+flakeNixPath dir = dir </> flakeNixFileName
+
+flakeLockPath :: FilePath -> FilePath
+flakeLockPath dir = dir </> flakeLockFileName
+
 flakeNixFileName :: FilePath
 flakeNixFileName = "flake.nix"
 
@@ -1485,7 +1543,9 @@ nixBuildThunkAttrWithCache thunkSpec thunkDir attr = do
     maximumMaybe . catMaybes <$> traverse (getModificationTimeMaybe . (thunkDir </>)) thunkFileNames
 
   let cachesAttrs = any isAttrCache $ _thunkSpec_files thunkSpec
-      isAttrCache = \case ThunkFileSpec_AttrCache -> True; _ -> False
+      isAttrCache = \case
+        ThunkFileSpec_AttrCache -> True
+        _ -> False
   for (guard cachesAttrs) $ \() -> do
     cachePath <- liftIO $ (</> attr <.> "out") <$> attrCacheDir thunkDir
     let cacheErrHandler e
@@ -1671,7 +1731,7 @@ withoutPreservedFlakeInterface checkout act = do
 -- goes on to report them.
 discardPreservedFlakeInterface :: MonadNixThunk m => FilePath -> m Bool
 discardPreservedFlakeInterface checkout = do
-  ours <- liftIO $ hasContent (checkout </> flakeNixFileName) Flake.unpackedSourceFlakeNix
+  ours <- liftIO $ hasContent (flakeNixPath checkout) Flake.unpackedSourceFlakeNix
   when ours $ do
     for_ generatedFlakeFiles $ \(name, _) -> do
       putLog Debug $ "Removing generated " <> T.pack (checkout </> name)

@@ -24,6 +24,10 @@ import Nix.Thunk.Flake.Flatten
 import Nix.Thunk.Flake.Name
 import Nix.Thunk.Flake.Ref
 
+--------------------------------------------------------------------------------
+-- Types
+--------------------------------------------------------------------------------
+
 -- | One node of a @flake.lock@.
 --
 -- Parameterised by how its edges are keyed, because the two kinds of node key
@@ -45,6 +49,10 @@ data LockEdge
   = LockEdge_Node FlakeId
   | LockEdge_Follows (FollowsPath FlakeId)
   deriving stock (Eq, Show)
+
+--------------------------------------------------------------------------------
+-- Lock nodes
+--------------------------------------------------------------------------------
 
 -- | Render the @flake.lock@ of a packed thunk whose upstream is itself a flake.
 --
@@ -122,6 +130,10 @@ renderSourceOnlyFlakeLock srcRefs =
         , lockNode_refs = Just srcRefs
         , lockNode_isFlake = False
         }
+
+--------------------------------------------------------------------------------
+-- JSON
+--------------------------------------------------------------------------------
 
 renderLockNodes
   :: (IsInputName rootKey, IsInputName key)

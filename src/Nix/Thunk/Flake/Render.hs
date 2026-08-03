@@ -12,13 +12,17 @@ import Nix.Thunk.Flake.Flatten
 import Nix.Thunk.Flake.Name
 import Nix.Thunk.Flake.Ref
 
+--------------------------------------------------------------------------------
+-- The generated flake
+--------------------------------------------------------------------------------
+
 -- | Render the @flake.nix@ of a packed thunk whose upstream is itself a flake.
 renderFlakeNix :: FlattenedFlake -> Text
 renderFlakeNix flake =
   T.unlines $
     fold @[]
       [
-        [ "# DO NOT HAND-EDIT THIS FILE"
+        [ doNotEditLine
         , "{"
         , "  inputs = {"
         ]
@@ -101,6 +105,10 @@ renderEdge name target =
 renderAttr :: AttrName -> FlakeRefValue -> Text
 renderAttr name value = "      " <> unAttrName name <> " = " <> renderRefValue value <> ";"
 
+--------------------------------------------------------------------------------
+-- Nix syntax
+--------------------------------------------------------------------------------
+
 -- | A reference as a standalone attribute set, for handing to
 -- @builtins.fetchTree@. Fetching the repository the same way the generated
 -- flake will also proves, at pack time, that the reference resolves.
@@ -136,6 +144,10 @@ escapeNixChar = \case
   '\t' -> "\\t"
   c -> T.singleton c
 
+--------------------------------------------------------------------------------
+-- Source-only flakes
+--------------------------------------------------------------------------------
+
 -- | The @flake.nix@ of a packed thunk whose upstream is not a flake. There are
 -- no inputs to expose, so this exposes the fetched source and nothing else. The
 -- content is the same for every such thunk.
@@ -149,7 +161,7 @@ renderSourceOnlyFlakeNix srcRef =
   T.unlines $
     fold @[]
       [
-        [ "# DO NOT HAND-EDIT THIS FILE"
+        [ doNotEditLine
         , "{"
         , "  description = \"nix-thunk packed thunk\";"
         , "  inputs = {"
@@ -188,3 +200,9 @@ unpackedSourceFlakeNix =
     outputs = { self }: { src = self.sourceInfo; };
   }
   """
+
+-- | The header of every generated flake.nix. 'unpackedSourceFlakeNix' repeats
+-- it inside its literal, which @default.nix@ has to match byte for byte, so
+-- it cannot refer to this: change one and change the other.
+doNotEditLine :: Text
+doNotEditLine = "# DO NOT HAND-EDIT THIS FILE"
