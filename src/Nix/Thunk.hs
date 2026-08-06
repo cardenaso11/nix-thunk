@@ -33,7 +33,7 @@ module Nix.Thunk
   , parseGitUri
   , GitUri (..)
   , uriThunkPtr
-  , Ref(..)
+  , Ref (..)
   , refFromHexString
   ) where
 
