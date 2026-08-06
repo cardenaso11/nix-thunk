@@ -25,7 +25,7 @@ import System.FilePath (isAbsolute, joinPath, splitDirectories, (</>))
 --------------------------------------------------------------------------------
 
 -- | An attribute of a flake reference, e.g. @owner@ or @rev@.
-newtype AttrName = AttrName { unAttrName :: Text }
+newtype AttrName = AttrName {unAttrName :: Text}
   deriving stock (Eq, Ord, Show)
   deriving newtype (Aeson.FromJSON, Aeson.FromJSONKey)
 
@@ -48,7 +48,7 @@ instance Aeson.FromJSON FlakeRefValue where
 -- @{ type = "github"; owner = "NixOS"; repo = "nixpkgs"; rev = "..."; }@.
 -- Attribute-set form is preferred over URL form so that no escaping or
 -- query-string assembly is needed.
-newtype FlakeRef = FlakeRef { unFlakeRef :: Map AttrName FlakeRefValue }
+newtype FlakeRef = FlakeRef {unFlakeRef :: Map AttrName FlakeRefValue}
   deriving stock (Eq, Ord, Show)
   deriving newtype (Aeson.FromJSON)
 
@@ -58,7 +58,7 @@ newtype FlakeRef = FlakeRef { unFlakeRef :: Map AttrName FlakeRefValue }
 -- A refinement of 'FlakeRef'
 --
 -- 'fetchableRef' is the way in and 'mapFetchableRef' the way to change one.
-newtype FetchableRef = FetchableRef { unFetchableRef :: FlakeRef }
+newtype FetchableRef = FetchableRef {unFetchableRef :: FlakeRef}
   deriving stock (Eq, Ord, Show)
 
 -- | The two references a lock records for one input: the one the flake

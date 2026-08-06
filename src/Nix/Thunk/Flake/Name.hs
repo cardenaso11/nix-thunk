@@ -28,7 +28,7 @@ import Data.Text qualified as T
 --
 -- Whatever a flake called something. Nix accepts any attribute name here, so
 -- this is the unconstrained end: see 'FlakeId' for the other.
-newtype InputName = InputName { unInputName :: Text }
+newtype InputName = InputName {unInputName :: Text}
   deriving stock (Eq, Ord, Show)
   deriving newtype (Aeson.FromJSON, Aeson.FromJSONKey)
 
@@ -41,7 +41,7 @@ newtype InputName = InputName { unInputName :: Text }
 -- Nix does not require this of a name being /declared/, which is how upstream
 -- comes to have inputs nobody can refer to: haskell.nix has fourteen,
 -- including @hls-1.10@.
-newtype FlakeId = FlakeId { flakeIdName :: InputName }
+newtype FlakeId = FlakeId {flakeIdName :: InputName}
   deriving stock (Eq, Ord, Show)
 
 -- | A @follows@ target: a sequence of input names walked from the root node.
@@ -50,7 +50,7 @@ newtype FlakeId = FlakeId { flakeIdName :: InputName }
 -- read out of upstream's lock is 'InputName's, taken as we find them. A path
 -- we write is 'FlakeId's, since Nix will parse it back as identifiers, and
 -- building one out of anything else is the mistake this is here to prevent.
-newtype FollowsPath name = FollowsPath { unFollowsPath :: [name] }
+newtype FollowsPath name = FollowsPath {unFollowsPath :: [name]}
   deriving stock (Eq, Ord, Show)
   deriving newtype (Aeson.FromJSON)
 

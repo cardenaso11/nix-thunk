@@ -26,7 +26,7 @@ import Nix.Thunk.Flake.Ref
 -- much of this package is about not confusing the two: see
 -- 'Nix.Thunk.Flake.Flatten.nodeInputNames' for what goes wrong when they are.
 -- 'nodeIdToInputName' is the only crossing.
-newtype NodeId = NodeId { unNodeId :: Text }
+newtype NodeId = NodeId {unNodeId :: Text}
   deriving stock (Eq, Ord, Show)
   deriving newtype (Aeson.FromJSON, Aeson.FromJSONKey)
 
@@ -251,4 +251,4 @@ childrenVia edges lock nodeId prefix =
 -- | Drop the declaration sites of a walk that was allowed to cross @follows@
 -- edges. Whatever it recorded as a parent may not be one.
 undeclared :: Map NodeId NodeOrigin -> Map NodeId NodeOrigin
-undeclared = fmap $ \origin -> origin { nodeOrigin_declaredIn = Nothing }
+undeclared = fmap $ \origin -> origin {nodeOrigin_declaredIn = Nothing}
