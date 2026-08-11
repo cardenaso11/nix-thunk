@@ -16,13 +16,15 @@ let
     let pkgs = import <nixpkgs> {}; in pkgs.git
   '';
 
-  # An upstream flake with a relative path input. It deliberately has no
-  # external inputs, so that locking it needs no network.
-  # `subAlias` is a second root-level name for the same lock node, which is what
-  # a root `follows` produces. Both names have to survive into the thunk.
+  # An upstream flake with a relative path input. This flake has no external
+  # inputs on purpose, so a lock of it needs no network.
   #
-  # `sub-1.10` is a name Nix accepts here and rejects in a `follows`, as
-  # haskell.nix's `hls-1.10` is. It has to be exposed under a name that works.
+  # `subAlias` is a second root-level name for the same lock node, and a root
+  # `follows` produces such a name. The thunk must keep both names.
+  #
+  # Nix accepts the name `sub-1.10` here, and Nix rejects that name in a
+  # `follows`. haskell.nix's `hls-1.10` has the same problem. The thunk must
+  # expose the node under a name that a `follows` accepts.
   flakeSample = pkgs.writeText "flake.nix" ''
     {
       inputs.sub.url = "path:./sub";
@@ -39,13 +41,13 @@ let
     { outputs = { self }: { value = "sub"; }; }
   '';
 
-  # What the override test substitutes for the thunk's `sub` input.
+  # The override test substitutes this flake for the thunk's `sub` input.
   flakeOverrideSample = pkgs.writeText "flake.nix" ''
     { outputs = { self }: { value = "overridden"; }; }
   '';
 
-  # Reads through the thunk: its outputs are forwarded, and `follows` reaches
-  # the inputs of the repository it points at.
+  # This flake reads through the thunk. The thunk forwards its outputs, and a
+  # `follows` reaches the inputs of the repository that the thunk points at.
   consumerReadSample = pkgs.writeText "flake.nix" ''
     {
       inputs.mythunk.url = "path:/root/code/myflake";
@@ -60,8 +62,8 @@ let
     }
   '';
 
-  # Overrides an input of the thunk, which must change what the thunk itself
-  # evaluates to.
+  # This flake overrides an input of the thunk, and that override must change
+  # the value of the thunk itself.
   consumerOverrideSample = pkgs.writeText "flake.nix" ''
     {
       inputs.mysub.url = "path:/root/code/mysub";
@@ -101,9 +103,9 @@ in
         imports = [ (pkgs.path + /nixos/modules/installer/cd-dvd/channel.nix) ];
         nix.useSandbox = false;
         nix.binaryCaches = [];
-        # Needed by the tests that consume a packed thunk as a flake input.
-        # `nix-thunk` itself does not rely on this: it passes
-        # `--extra-experimental-features` on every command it runs.
+        # The tests that consume a packed thunk as a flake input need this
+        # setting. `nix-thunk` itself does not need it, because `nix-thunk`
+        # passes `--extra-experimental-features` on every command that it runs.
         nix.extraOptions = ''
           experimental-features = nix-command flakes
         '';
@@ -260,8 +262,8 @@ in
           grep -qF 'inherit src' ~/code/myapp/flake.nix;
           grep -qF 'flake = false' ~/code/myapp/flake.nix;
 
-          # `src` is a fetched tree, not a bare path, and stays one whether the
-          # thunk is packed or unpacked.
+          # `src` is a fetched tree, and not a bare path. It stays a fetched
+          # tree after a pack and after an unpack.
           nix eval --raw "path:$HOME/code/myapp#src.outPath" >/dev/null;
           nix eval --raw "path:$HOME/code/myapp#src.narHash" >/dev/null;
         """)
@@ -273,14 +275,14 @@ in
           nix eval --raw "path:$HOME/code/myapp#src.outPath" >/dev/null;
           nix eval --raw "path:$HOME/code/myapp#src.narHash" >/dev/null;
 
-          # The generated files must not read as work in progress, or packing
+          # Git must not report the generated files as unsaved work, or a pack
           # would refuse to continue.
           test -z "$(git -C ~/code/myapp status --porcelain)";
         """)
 
       with subtest("an unpacked thunk's source leaves out the generated flake files"):
-        # `nix eval` rather than `nix-instantiate --eval`, which is read-only
-        # and so never copies the filtered source into the store.
+        # This test uses `nix eval`, because `nix-instantiate --eval` is
+        # read-only and never copies the filtered source into the store.
         client.succeed("""
           nix eval --impure --raw --expr '
             let
@@ -313,9 +315,9 @@ in
           grep -qF 'inherit src' ~/code/myapp/flake.nix;
           grep -qF 'flake = false' ~/code/myapp/flake.nix;
 
-          # nix-thunk writes the lock itself. Nix leaving it untouched is what
-          # says the file is complete and up to date, since anything it had to
-          # resolve for itself it would also have rewritten.
+          # nix-thunk writes the lock itself. Nix does not change the file, and
+          # that proves the file is complete and current. Nix would rewrite the
+          # file for any input that Nix had to resolve itself.
           cp ~/code/myapp/flake.lock /tmp/myapp.lock.packed;
           (cd ~/code/myapp && nix flake lock);
           cmp ~/code/myapp/flake.lock /tmp/myapp.lock.packed;
@@ -331,13 +333,13 @@ in
           test ! -e ~/code/myapp-noflake/flake.lock;
           nix-build ~/code/myapp-noflake;
 
-          # Unpacking keeps whichever format the thunk has, so there is no
-          # interface to preserve here and none is written.
+          # An unpack keeps the format that the thunk has. This thunk has no
+          # flake interface, so this code preserves nothing and writes nothing.
           nix-thunk unpack ~/code/myapp-noflake;
           test ! -e ~/code/myapp-noflake/flake.nix;
           test -z "$(git -C ~/code/myapp-noflake status --porcelain)";
 
-          # Packing without the flag brings it up to the newest format.
+          # A pack without the flag moves the thunk to the newest format.
           nix-thunk pack ~/code/myapp-noflake;
           test -f ~/code/myapp-noflake/flake.nix;
         """)
@@ -372,17 +374,18 @@ in
           test -n "$rev";
           grep -qF "$rev" ~/code/myflake/flake.lock;
 
-          # Upstream's own inputs are exposed under upstream's own names, both
-          # of the names that resolve to the same node included.
+          # The thunk exposes upstream's own inputs under upstream's own names.
+          # This includes both names that resolve to the same node.
           grep -qF '"sub"' ~/code/myflake/flake.nix;
           grep -qF '"subAlias"' ~/code/myflake/flake.nix;
 
-          # A name Nix will not accept in a `follows` is exposed under one it
-          # will, and is never written into an override.
+          # Nix does not accept some names in a `follows`. The thunk exposes
+          # such a name under a name that Nix accepts, and it never writes the
+          # original name into an override.
           grep -qF '"sub-1_10"' ~/code/myflake/flake.nix;
           test -z "$(grep -F '"sub-1.10"' ~/code/myflake/flake.nix)";
 
-          # Whatever wrote the lock, Nix has to agree with it as it stands.
+          # Nix must accept the lock without a change, whatever code wrote it.
           cp ~/code/myflake/flake.lock /tmp/myflake.lock.packed;
           (cd ~/code/myflake && nix flake lock);
           cmp ~/code/myflake/flake.lock /tmp/myflake.lock.packed;
@@ -486,8 +489,9 @@ in
              exit 1
           fi
 
-          # A worktree stands in for the thunk, so it carries the same flake
-          # interface an unpacked checkout does, and reads as clean.
+          # A worktree replaces the thunk, so the worktree carries the same
+          # flake interface as an unpacked checkout. Git reports the worktree as
+          # clean.
           test -f ~/code/myapp-2/flake.nix;
           test -z "$(git -C ~/code/myapp-2 status --porcelain)";
         """);

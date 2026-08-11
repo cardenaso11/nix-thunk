@@ -1,14 +1,15 @@
--- | Writing the @flake.lock@ of a packed thunk.
+-- | This module renders the @flake.lock@ of a packed thunk.
 --
--- Written here rather than by running @nix flake lock@ on the generated flake.
--- Locking resolves every input a flake declares, and the generated one
--- declares an input per node of upstream's lock, so packing would fetch
--- upstream's whole transitive closure and fail on any single pin it could not
--- reach. Every reference and hash the lock needs is already in upstream's own
--- lock, which makes this a relabelling of that rather than new information.
+-- This module writes the lock, and it does not run @nix flake lock@ on the
+-- generated flake. A lock resolves every input that a flake declares. The
+-- generated flake declares one input for each node of upstream's lock, so a
+-- lock run would fetch upstream's whole transitive closure. The run would also
+-- fail on any single pin that it could not reach. Upstream's own lock already
+-- holds every reference and hash that our lock needs, so this module relabels
+-- upstream's lock, and it adds no new information.
 --
--- The types here describe a lock being written, and are deliberately not the
--- ones in "Nix.Thunk.Flake.Upstream", which describe one being read.
+-- The types here describe a lock that we write. The types in
+-- "Nix.Thunk.Flake.Upstream" describe a lock that we read.
 module Nix.Thunk.Flake.Lockfile where
 
 import Data.Aeson qualified as Aeson
@@ -30,21 +31,23 @@ import Nix.Thunk.Flake.Ref
 
 -- | One node of a @flake.lock@.
 --
--- Parameterised by how its edges are keyed, because the two kinds of node key
--- them differently: the lock's root binds our own inputs, so 'FlakeId', while
--- every other node reproduces the names upstream used, so 'InputName'.
+-- This type takes the key of its edges as a parameter, because the two kinds of
+-- node use different keys. The lock's root binds our own inputs, so it uses a
+-- 'FlakeId'. Every other node repeats the names that upstream used, so it uses
+-- an 'InputName'.
 data LockNode name = LockNode
   { lockNode_edges :: Map name LockEdge
   , lockNode_refs :: Maybe NodeRefs
-  -- ^ 'Nothing' for the root node, which is the flake being locked.
+  -- ^ 'Nothing' for the root node, which is the flake that we lock.
   , lockNode_isFlake :: Bool
   }
   deriving stock (Eq, Show)
 
--- | An edge of a @flake.lock@: a node id, or a path walked from the root.
+-- | An edge of a @flake.lock@: a node id, or a path from the root.
 --
--- Both are names we chose. Node ids in a lock may be any string, but ours are
--- the input names, and a path is walked as flake identifiers whoever wrote it.
+-- We chose both names. A node id in a lock can hold any string, and our node
+-- ids hold the input names. Nix walks a path as flake identifiers, whatever
+-- code wrote the lock.
 data LockEdge
   = LockEdge_Node FlakeId
   | LockEdge_Follows (FollowsPath FlakeId)
@@ -54,16 +57,17 @@ data LockEdge
 -- Lock nodes
 --------------------------------------------------------------------------------
 
--- | Render the @flake.lock@ of a packed thunk whose upstream is itself a flake.
+-- | The @flake.lock@ of a packed thunk whose upstream is itself a flake.
 --
--- Only valid when 'flattenedFlake_complete' holds: an input the generated
--- flake did not fully declare is one Nix would have had to work out for
--- itself, and a lock missing it is not a lock.
+-- The result is valid only when 'flattenedFlake_complete' holds. The generated
+-- flake can leave an input partly declared, and Nix would then have to resolve
+-- that input itself. A lock without that input is not a complete lock.
 renderFlakeLock :: FlattenedFlake -> LBS.ByteString
 renderFlakeLock flake = renderLockNodes (rootLockNode flake) (lockNodes flake)
 
--- | The root node of the generated flake's lock: an edge to the thunk's source
--- and one to every input, with the aliases recorded as the paths they follow.
+-- | The root node of the generated flake's lock. The node holds an edge to the
+-- thunk's source, and one edge to every input. Each alias holds the path that
+-- it follows.
 rootLockNode :: FlattenedFlake -> LockNode FlakeId
 rootLockNode flake =
   LockNode
@@ -81,9 +85,10 @@ rootLockEdge name input = case input.flattenedInput_ref of
   Left followsPath -> LockEdge_Follows followsPath
   Right _ -> LockEdge_Node name
 
--- | Every node of the generated flake's lock, keyed by node id. Node ids are
--- the input names, which are unique by construction, and an input that is only
--- a @follows@ has no node at all: it lives on the edge that reaches it.
+-- | Every node of the generated flake's lock, with a node id as the key. A node
+-- id is an input name, and the input names are unique. An input that holds only
+-- a @follows@ gets no node, because the edge that reaches it carries the whole
+-- @follows@.
 lockNodes :: FlattenedFlake -> Map FlakeId (LockNode InputName)
 lockNodes flake =
   Map.insert flake.flattenedFlake_sourceName sourceNode $
@@ -107,13 +112,13 @@ inputLockNode input = case input.flattenedInput_ref of
         , lockNode_isFlake = input.flattenedInput_isFlake
         }
 
--- | Every edge of a non-root node points at one of our root-level inputs,
--- which from inside the lock is a one-step walk from the root.
+-- | Every edge of a non-root node points at one of our root-level inputs. From
+-- inside the lock, such an input is a one-step walk from the root.
 rootFollows :: FlakeId -> FollowsPath FlakeId
 rootFollows name = FollowsPath [name]
 
--- | Render the @flake.lock@ of a packed thunk whose upstream is not a flake.
--- It has the one input the flake declares, and nothing else.
+-- | The @flake.lock@ of a packed thunk whose upstream is not a flake. The lock
+-- holds the one input that the flake declares, and it holds nothing else.
 renderSourceOnlyFlakeLock :: NodeRefs -> LBS.ByteString
 renderSourceOnlyFlakeLock srcRefs =
   renderLockNodes
@@ -125,7 +130,8 @@ renderSourceOnlyFlakeLock srcRefs =
     $ Map.singleton
       sourceOnlyInputName
       LockNode
-        { -- Keyed as every non-root node is, though this one has no edges to key.
+        { -- This node uses the same key as every non-root node, and this node
+          -- has no edges.
           lockNode_edges = Map.empty :: Map InputName LockEdge
         , lockNode_refs = Just srcRefs
         , lockNode_isFlake = False
@@ -155,14 +161,14 @@ lockJson root nodes =
     ]
   where
     rootId = rootLockNodeId nodes
-    -- The root node and the rest key their edges differently, so this is
-    -- polymorphic in both, and the two calls above instantiate it each way.
+    -- The root node and the other nodes use different key types for their
+    -- edges, so `nodeEntry` is polymorphic in both keys.
     nodeEntry :: (IsInputName name, IsInputName edgeKey) => name -> LockNode edgeKey -> Aeson.Pair
     nodeEntry name node = (nameKey name, lockNodeJson node)
 
--- | The id of the lock's root node. Nix takes it from the top-level @root@
--- field rather than by name, so it can step aside on the off chance upstream
--- has an input called @root@.
+-- | The id of the lock's root node. Nix reads this id from the top-level @root@
+-- field, and not from the name. So this function can choose another name when
+-- upstream already has an input called @root@.
 rootLockNodeId :: Map FlakeId (LockNode key) -> FlakeId
 rootLockNodeId nodes = freshInputName (Map.keysSet nodes) $ toFlakeId $ InputName "root"
 
@@ -172,7 +178,7 @@ lockNodeJson node = Aeson.object $ edges <> refs <> flake
     edges, refs, flake :: [Aeson.Pair]
     edges = [("inputs", lockEdgesJson node.lockNode_edges) | not $ Map.null node.lockNode_edges]
     refs = foldMap refsJson node.lockNode_refs
-    -- Nix takes an input to be a flake unless told otherwise.
+    -- Nix treats an input as a flake by default.
     flake = [("flake", Aeson.Bool False) | not node.lockNode_isFlake]
     refsJson r =
       [ ("locked", flakeRefJson r.nodeRefs_locked)
@@ -202,10 +208,8 @@ refValueJson = \case
 nameKey :: IsInputName name => name -> Key.Key
 nameKey = Key.fromText . nameText
 
--- | Two-space indentation with sorted keys and a trailing newline, which is
--- how Nix writes a lock itself. Nothing reads the file back by content, but a
--- generated file that a person may open should not look foreign next to the
--- ones Nix wrote.
+-- | Two-space indentation, sorted keys, and a trailing newline. Nix writes a
+-- lock in the same shape, so this file matches the locks that Nix wrote.
 lockJsonConfig :: Config
 lockJsonConfig =
   defConfig
@@ -214,14 +218,15 @@ lockJsonConfig =
     , confTrailingNewline = True
     }
 
--- | The lock format this writes. Nix has kept this at 7 since flakes were
--- introduced, and refuses anything newer than it knows.
+-- | The lock format that this module writes. Nix introduced version 7 with the
+-- first release of flakes, and Nix still uses it. Nix refuses a version that it
+-- does not know.
 lockVersion :: Aeson.Value
 lockVersion = Aeson.Number 7
 
--- | The lock of a flake with no inputs. Written directly rather than by
--- invoking Nix, so that packing a repository which is not a flake does not
--- require the flakes feature to be enabled.
+-- | The lock of a flake with no inputs. This module writes the text directly,
+-- and it does not call Nix. So a pack of a repository that is not a flake needs
+-- no flakes feature.
 emptyFlakeLock :: Text
 emptyFlakeLock =
   """

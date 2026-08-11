@@ -1,8 +1,8 @@
 packages: .
 
--- GHC 9.14 ships base 4.22 and template-haskell 2.24, which most of the
--- dependency tree still caps below. The upper bounds keep the relaxation from
--- reaching past 9.14 itself.
+-- GHC 9.14 ships base 4.22 and template-haskell 2.24. Most of the dependency
+-- tree still sets a lower cap than those versions. The upper bounds stop the
+-- relaxation at 9.14.
 if impl(ghc == 9.14.*)
   allow-newer:
       *:base

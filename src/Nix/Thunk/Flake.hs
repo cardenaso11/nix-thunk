@@ -1,30 +1,31 @@
--- | Generating the @flake.nix@ and @flake.lock@ of a packed thunk.
+-- | This module generates the @flake.nix@ and @flake.lock@ of a packed thunk.
 --
--- A packed thunk is itself a flake which forwards the outputs of the repository
--- it points at. For a consumer to be able to write
+-- A packed thunk is also a flake. It forwards the outputs of the repository
+-- that it points at. A consumer must be able to write this:
 --
 -- > inputs.someinput.follows = "mythunk/nixpkgs";       # read
 -- > inputs.mythunk.inputs.nixpkgs.follows = "nixpkgs";  # override
 --
--- the thunk's flake has to expose upstream's inputs under upstream's own names,
--- which is what "Nix.Thunk.Flake.Flatten" works out and the two renderers write
--- down.
+-- So the thunk's flake exposes upstream's inputs under upstream's own names.
 --
--- Everything under here is pure. Fetching upstream, writing the files and
--- having Nix check the result is left to "Nix.Thunk.Internal".
+-- Every function in these modules is pure. "Nix.Thunk.Internal" does the impure
+-- work:
 --
--- Reading order, which is also the dependency order:
+-- * It fetches upstream.
+-- * It writes the files.
+-- * It asks Nix to check the result.
 --
--- * "Nix.Thunk.Flake.Name": what an input may be called, and the rule Nix
---   imposes on names it has to parse.
--- * "Nix.Thunk.Flake.Ref": where a tree comes from, and the two forms of that
---   a lock records.
--- * "Nix.Thunk.Flake.Upstream": the lock we read, and how to walk it.
--- * "Nix.Thunk.Flake.Flatten": the translation from upstream's graph to ours.
--- * "Nix.Thunk.Flake.Render": the @flake.nix@ we write.
--- * "Nix.Thunk.Flake.Lockfile": the @flake.lock@ we write.
+-- The modules, in dependency order:
 --
--- This module re-exports all of them, so a caller can import it alone.
+-- * "Nix.Thunk.Flake.Name" defines the names that an input can take, and the
+--   rule that Nix imposes on a name that it parses.
+-- * "Nix.Thunk.Flake.Ref" defines the origin of a tree, and the two forms that
+--   a lock records it in.
+-- * "Nix.Thunk.Flake.Upstream" defines the lock that we read, and the way to
+--   walk it.
+-- * "Nix.Thunk.Flake.Flatten" translates upstream's graph into ours.
+-- * "Nix.Thunk.Flake.Render" renders the @flake.nix@ that we write.
+-- * "Nix.Thunk.Flake.Lockfile" renders the @flake.lock@ that we write.
 module Nix.Thunk.Flake
   ( module Nix.Thunk.Flake.Name
   , module Nix.Thunk.Flake.Ref

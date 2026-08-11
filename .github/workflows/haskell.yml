@@ -10,8 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # release.nix imports dep/style.hs at evaluation time, so the style
-          # checks cannot even be read from a non-recursive clone.
+          # release.nix imports dep/style.hs at evaluation time, so a
+          # non-recursive clone cannot even read the style checks.
           submodules: true
       - uses: cachix/install-nix-action@v31
         with:

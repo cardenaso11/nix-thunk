@@ -11,10 +11,11 @@
     let nixpkgs = if inputs ? "nixpkgs" then inputs.nixpkgs else builtins.getFlake "nixpkgs";
         eachSystem = nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed;
 
-        # The entry points below take no `system`, since they are meant to work
-        # outside a flake too, so the flake hands each one a package set built
-        # for one. They work the rest out for themselves, including
-        # `gitignoreSource` from dep/gitignore.nix.
+        # The entry points below take no `system`, because they must also work
+        # outside a flake. So this flake builds a package set for one system and
+        # passes that set to each entry point. The entry points compute
+        # everything else themselves, including `gitignoreSource` from
+        # dep/gitignore.nix.
         pkgsFor = system: inputs.haskell-nix.legacyPackages.${system};
         nixThunkFor = system: import ./default.nix { pkgs = pkgsFor system; };
     in {

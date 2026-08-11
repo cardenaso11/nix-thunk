@@ -35,9 +35,9 @@ rec {
         let
           packed = jsonFileName: {
             required = { ${jsonFileName} = "regular"; "default.nix" = "regular"; "thunk.nix" = "regular"; };
-            # flake.nix and flake.lock are present on thunks packed by newer
-            # versions of nix-thunk, which are also usable as flake inputs.
-            # They are optional so that older thunks still match.
+            # A newer version of nix-thunk writes flake.nix and flake.lock into
+            # a thunk, and a consumer can then use that thunk as a flake input.
+            # These files stay optional, so an older thunk still matches.
             optional = {
               ".attr-cache" = "directory";
               "flake.nix" = "regular";
@@ -56,16 +56,16 @@ rec {
           || throw "Thunk at ${toString p} has files in addition to ${name} and optionally default.nix and .attr-cache. Remove either ${name} or those other files to continue (check for leftover .git too)."
         else false;
 
-      # `nix-thunk unpack` writes these into a checkout of a repository that
-      # has no flake of its own, so that anyone consuming the thunk as a flake
-      # input is not broken while it is unpacked. Git is told to ignore them
-      # through .git/info/exclude, which `gitignoreSource` does not read, so
-      # they are dropped here instead: an unpacked dependency has to present
-      # the same source as a packed one.
+      # `nix-thunk unpack` writes these files into a checkout of a repository
+      # that has no flake of its own. A consumer then keeps working while the
+      # thunk stays unpacked. `nix-thunk` hides them from git through
+      # .git/info/exclude, and `gitignoreSource` does not read that file, so
+      # this filter drops them instead. An unpacked dependency must present the
+      # same source as a packed thunk.
       #
-      # Byte for byte what nix-thunk writes, see `Nix.Thunk.Flake`. Matching on
-      # content rather than name is what leaves a flake the repository really
-      # does have alone.
+      # These strings match what nix-thunk writes, byte for byte. See
+      # `Nix.Thunk.Flake`. This filter compares content, and not names, so it
+      # leaves a flake that the repository really owns in place.
       generatedFlakeFiles = {
         "flake.nix" = ''
           # DO NOT HAND-EDIT THIS FILE
@@ -85,13 +85,13 @@ rec {
         '';
       };
 
-      # A final newline is not part of the comparison: nix-thunk writes these
-      # without one, and Nix would put one back if it ever rewrote the lock.
+      # This comparison ignores a final newline. nix-thunk writes these files
+      # without a final newline, and Nix would add one if it rewrote the lock.
       sameFile = a: b: lib.removeSuffix "\n" a == lib.removeSuffix "\n" b;
 
-      # Wrapping the caller's source keeps this working whether `gitignoreSource`
-      # hands back a bare path or a filtered source: either way `origSrc` names
-      # the directory the filter sees paths under.
+      # This code wraps the caller's source, because `gitignoreSource` can
+      # return a bare path or a filtered source. Either way `origSrc` names the
+      # directory that the filter reads paths from.
       unfilteredSource = lib.cleanSourceWith { src = gitignoreSource p; };
       generatedFlakeFilePaths = builtins.filter
         (path:
