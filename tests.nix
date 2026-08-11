@@ -379,11 +379,13 @@ in
           grep -qF '"sub"' ~/code/myflake/flake.nix;
           grep -qF '"subAlias"' ~/code/myflake/flake.nix;
 
-          # Nix does not accept some names in a `follows`. The thunk exposes
-          # such a name under a name that Nix accepts, and it never writes the
-          # original name into an override.
+          # Nix does not accept some names in a `follows`. The thunk binds such
+          # a node under a name that Nix accepts. The thunk never writes the
+          # original name into a `follows`. The override keeps the original
+          # name, because Nix reads an override as an attribute name.
           grep -qF '"sub-1_10"' ~/code/myflake/flake.nix;
-          test -z "$(grep -F '"sub-1.10"' ~/code/myflake/flake.nix)";
+          grep -qF '"sub-1.10" = { follows = "sub-1_10"; };' ~/code/myflake/flake.nix;
+          test -z "$(grep -F 'follows = "sub-1.10"' ~/code/myflake/flake.nix)";
 
           # Nix must accept the lock without a change, whatever code wrote it.
           cp ~/code/myflake/flake.lock /tmp/myflake.lock.packed;

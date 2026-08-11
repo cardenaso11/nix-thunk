@@ -157,7 +157,6 @@ flattenedInputs ctx =
 --
 -- * The edge points at a node with no reference of its own.
 -- * The edge holds a @follows@ that leaves the graph.
--- * Nix does not accept the edge's name in an override.
 --
 -- Nix must settle every dropped edge from upstream's own lock. This package
 -- cannot write a lock that records upstream's inputs, so this flake is then
@@ -210,20 +209,17 @@ aliasInput target =
 -- | The edges of a node that the generated flake restates as a @follows@ onto
 -- one of its own inputs.
 --
--- This function leaves two kinds of edge for upstream's own lock to resolve.
--- The first kind points at an aliased node. Such a node already carries a
--- @follows@. An override of that edge would make the alias follow itself, and
--- Nix rejects that as a follow cycle. The second kind carries a name that
--- is not a flake identifier. Nix writes an override as an attribute path, so
--- nobody can override such an edge.
+-- This function leaves one kind of edge for upstream's own lock to resolve.
+-- Such an edge points at an aliased node. That node already carries a
+-- @follows@. An override of that edge makes the alias follow itself. Nix
+-- rejects a follow cycle.
 --
--- The key stays an 'InputName'. The key must hold the name that upstream
--- declared, or the override names nothing. So this function drops an unusable
--- name, and it does not repair the name.
+-- The key stays an 'InputName'. An override is an attribute name. Nix accepts
+-- any name in that place. So the key holds the name that upstream declared.
+-- This function repairs no name. Only the value of the @follows@ has to be a
+-- 'FlakeId'.
 overridableEdges :: FlattenContext -> Map InputName NodeId -> Map InputName FlakeId
-overridableEdges ctx = fmap (inputNameOf ctx) . Map.filterWithKey overridable
-  where
-    overridable edgeName target = isFlakeId edgeName && nodeHasRef ctx target
+overridableEdges ctx = fmap (inputNameOf ctx) . Map.filter (nodeHasRef ctx)
 
 -- | Defines the context and the references together, and each one refers to the
 -- other.

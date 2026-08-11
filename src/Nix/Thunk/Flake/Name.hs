@@ -3,8 +3,9 @@
 --
 -- An 'InputName' is any name that a flake gave an input, and Nix accepts any
 -- name here. A 'FlakeId' is an 'InputName' that Nix also accepts where it
--- /parses/ a name. A @follows@ target is one such place, and an override
--- attribute path is another.
+-- /parses/ a name. A @follows@ target is one such place. The
+-- @--override-input@ argument is another such place. An override inside a
+-- @flake.nix@ is an attribute name. Nix accepts any name in that place.
 --
 -- A name that we read from upstream's lock is an 'InputName'. Upstream chose
 -- it, and an override must match it exactly. A name that the generated flake
@@ -70,8 +71,8 @@ instance IsInputName FlakeId where
 -- | The name unchanged as a 'FlakeId' when Nix accepts it, and 'Nothing' when
 -- Nix does not.
 --
--- Use this function for a name that must match upstream, such as an override
--- attribute path. We cannot repair such a name, so we drop the edge.
+-- Use this function for a name that a @follows@ must reach with upstream's own
+-- spelling. We cannot repair such a name, so we drop it.
 flakeId :: InputName -> Maybe FlakeId
 flakeId name
   | isFlakeId name = Just $ FlakeId name
