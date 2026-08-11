@@ -1,0 +1,18 @@
+packages: .
+
+-- GHC 9.14 ships base 4.22 and template-haskell 2.24. Most of the dependency
+-- tree still sets a lower cap than those versions. The upper bounds stop the
+-- relaxation at 9.14.
+if impl(ghc == 9.14.*)
+  allow-newer:
+      *:base
+    , *:template-haskell
+    , *:ghc-experimental
+    , *:ghc-internal
+    , patch:containers
+    , parser-regex:ghc-bignum
+  constraints:
+      base < 4.23
+    , template-haskell < 2.25
+    , ghc-experimental < 9.1500
+    , ghc-internal < 9.1500

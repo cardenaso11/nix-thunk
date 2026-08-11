@@ -190,6 +190,69 @@ read historical thunk formats, while newly written thunks use the latest format.
 This lets repositories update the tool independently from their existing
 dependency pointers.
 
+## Thunks as flake inputs
+
+A packed thunk is also a flake, so you can use it as an input directly:
+
+```nix
+inputs.mythunk.url = "path:./dep/mythunk";
+```
+
+The generated `flake.nix` forwards the outputs of the repository that the thunk
+points at. It also exposes that repository's own inputs. Each input keeps its
+own name, and the flake pins each input to the revision that upstream locked. So
+`follows` works in both directions:
+
+```nix
+# Use whatever the thunk uses
+inputs.someinput.follows = "mythunk/nixpkgs";
+
+# Make the thunk use yours
+inputs.mythunk.inputs.nixpkgs.follows = "nixpkgs";
+```
+
+Note two limits. First, `mythunk.outPath` is the thunk directory, and not the
+fetched source, because Nix always takes a flake's `outPath` from its own source
+tree. Use the named outputs instead. Second, upstream can declare an input as a
+relative path that leaves its repository. Such an input cannot have a reference
+of its own, so the flake exposes it as an alias. You can read the alias, and you
+cannot override it.
+
+When the repository is not a flake, the generated flake has no inputs to expose,
+and it provides the fetched source as `src`. `src` is a fetched tree, and not a
+bare path, so `src` holds both `src.outPath` and `src.narHash`.
+
+`nix-thunk` usually writes the `flake.lock` from upstream's own lock, and it
+does not run `nix flake lock`. So a pack does not fetch the repositories that
+upstream depends on, and a pack does not fail when one of those repositories is
+unreachable. The result matches the lock that Nix writes itself, so `nix flake
+lock` on a packed thunk changes nothing. When `nix-thunk` cannot restate an
+input, it asks Nix to resolve that input, and the pack then takes as long as it
+did before.
+
+`nix-thunk` cannot restate an input in two cases. Upstream declared the input as
+a path outside its own repository, or upstream gave the input a name that Nix
+does not accept in a `follows`. A flake can declare an input called `hls-1.10`,
+as haskell.nix does, and nothing can refer to that name. So the flake exposes
+such an input under the nearest name that Nix accepts (`hls-1_10`). It leaves
+the input for upstream's own lock to resolve.
+
+You can turn all of this off. `create`, `pack` and `update` take `--no-flake`,
+and they then write the newest format that carries no flake files. The format
+belongs to the thunk, so `unpack` keeps the format that it finds. A pack without
+the flag moves a thunk to the newest format.
+
+The flake interface survives `nix-thunk unpack` and `nix-thunk worktree`, so a
+project can keep building while you develop a dependency. An unpacked thunk of a
+flake repository is that repository's own flake, and it exposes the same outputs
+and the same input names. For a repository that is not a flake, `nix-thunk`
+writes a generated `flake.nix` and `flake.lock` into the checkout. They provide
+the same `src` output in the same shape. `nix-thunk` hides those files through
+git's `info/exclude`, so git still reports the checkout as clean. A pack removes
+them again. `nix-thunk` writes nothing when the repository already holds a
+`flake.nix` or a `flake.lock`. It also leaves a `flake.nix` that you write
+yourself in place.
+
 ## Binary cache
 
 Builds from this repository are published to the Reflex binary cache. For a

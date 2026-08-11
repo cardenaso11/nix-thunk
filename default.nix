@@ -35,7 +35,14 @@ rec {
         let
           packed = jsonFileName: {
             required = { ${jsonFileName} = "regular"; "default.nix" = "regular"; "thunk.nix" = "regular"; };
-            optional = { ".attr-cache" = "directory"; };
+            # A newer version of nix-thunk writes flake.nix and flake.lock into
+            # a thunk, and a consumer can then use that thunk as a flake input.
+            # These files stay optional, so an older thunk still matches.
+            optional = {
+              ".attr-cache" = "directory";
+              "flake.nix" = "regular";
+              "flake.lock" = "regular";
+            };
           };
         in builtins.any (n: contentsMatch (packed n)) [ "git.json" "github.json" ];
 
@@ -48,6 +55,58 @@ rec {
           }
           || throw "Thunk at ${toString p} has files in addition to ${name} and optionally default.nix and .attr-cache. Remove either ${name} or those other files to continue (check for leftover .git too)."
         else false;
+
+      # `nix-thunk unpack` writes these files into a checkout of a repository
+      # that has no flake of its own. A consumer then keeps working while the
+      # thunk stays unpacked. `nix-thunk` hides them from git through
+      # .git/info/exclude, and `gitignoreSource` does not read that file, so
+      # this filter drops them instead. An unpacked dependency must present the
+      # same source as a packed thunk.
+      #
+      # These strings match what nix-thunk writes, byte for byte. See
+      # `Nix.Thunk.Flake`. This filter compares content, and not names, so it
+      # leaves a flake that the repository really owns in place.
+      generatedFlakeFiles = {
+        "flake.nix" = ''
+          # DO NOT HAND-EDIT THIS FILE
+          {
+            description = "nix-thunk unpacked thunk";
+            outputs = { self }: { src = self.sourceInfo; };
+          }
+        '';
+        "flake.lock" = ''
+          {
+            "nodes": {
+              "root": {}
+            },
+            "root": "root",
+            "version": 7
+          }
+        '';
+      };
+
+      # This comparison ignores a final newline. nix-thunk writes these files
+      # without a final newline, and Nix would add one if it rewrote the lock.
+      sameFile = a: b: lib.removeSuffix "\n" a == lib.removeSuffix "\n" b;
+
+      # This code wraps the caller's source, because `gitignoreSource` can
+      # return a bare path or a filtered source. Either way `origSrc` names the
+      # directory that the filter reads paths from.
+      unfilteredSource = lib.cleanSourceWith { src = gitignoreSource p; };
+      generatedFlakeFilePaths = builtins.filter
+        (path:
+             builtins.pathExists path
+          && sameFile (builtins.readFile path) generatedFlakeFiles.${baseNameOf path})
+        (map (name: toString unfilteredSource.origSrc + "/" + name)
+             (builtins.attrNames generatedFlakeFiles));
+      unpackedSource =
+        if generatedFlakeFilePaths == []
+        then gitignoreSource p
+        else (lib.cleanSourceWith {
+          inherit (unfilteredSource) name;
+          src = unfilteredSource;
+          filter = path: _: !(builtins.elem (toString path) generatedFlakeFilePaths);
+        }).outPath;
     in
       if isObeliskThunkWithThunkNix then import (p + "/thunk.nix")
       else if hasValidThunk "git.json" then (
@@ -60,7 +119,7 @@ rec {
         pkgs.fetchFromGitHub (filterArgs (builtins.fromJSON (builtins.readFile (p + "/github.json"))))
       else {
         name = baseNameOf p;
-        outPath = gitignoreSource p;
+        outPath = unpackedSource;
       };
 
   #TODO: This really shouldn't include *all* symlinks, just ones that point at directories

@@ -2,6 +2,81 @@
 
 # Unreleased
 
+* Packed thunks are now flakes. Alongside `default.nix` and `thunk.nix`, a
+  packed thunk carries a generated `flake.nix` and `flake.lock`, so you can use
+  a thunk as a flake input:
+
+  ```nix
+  inputs.mythunk.url = "path:./dep/mythunk";
+  ```
+
+  The thunk's flake forwards the outputs of the repository that it points at. It
+  also exposes that repository's own inputs under their own names, and it pins
+  each input to the revision that upstream locked. So `follows` works in both
+  directions:
+
+  ```nix
+  inputs.someinput.follows = "mythunk/nixpkgs";        # read
+  inputs.mythunk.inputs.nixpkgs.follows = "nixpkgs";   # override
+  ```
+
+  When the repository is not a flake, the generated flake exposes the fetched
+  source as `src` instead.
+
+  The flake interface survives `unpack` and `worktree`, so a project keeps
+  building while you develop a dependency. For a repository that is not a flake,
+  `nix-thunk` writes the same files into the checkout and hides them through
+  git's `info/exclude`. `pack` removes them again. `nix-thunk` writes nothing
+  when the repository already has a `flake.nix` or a `flake.lock`. It also
+  leaves a `flake.nix` that you wrote yourself in place.
+
+  This release introduces the `github-v9` and `git-v10` thunk specs. They fetch
+  exactly as `github-v8` and `git-v9` do, and they add the flake files. Please
+  update all your thunks:
+  `nix-thunk unpack $path; nix-thunk pack $path`.
+
+  **Breaking:** the two extra files mean that a packed thunk no longer matches
+  the `thunkSource` in an older vendored copy of this repository's
+  `default.nix`. Such a copy rejects any file that it does not recognise. A
+  project that pins an older nix-thunk for its Nix code must update that pin
+  before it updates its thunks.
+
+* `create`, `pack` and `update` accept `--no-flake`, which writes a thunk in the
+  newest format that carries no flake files. You cannot use such a thunk as a
+  flake input, so the flag serves a project that does not want the interface.
+  The format belongs to the thunk, and not to the tool. `unpack` keeps the
+  format that the thunk already had, and a pack without the flag moves a thunk
+  to the newest format.
+
+* A pack no longer fetches the repositories that a flake dependency points at.
+  `nix-thunk` writes the generated `flake.lock` from upstream's own lock, which
+  already records every reference and hash that the lock needs. `nix-thunk` does
+  not run `nix flake lock` over inputs that Nix would resolve one at a time. So
+  a pack of a thunk of a repository with a large dependency graph no longer
+  downloads that graph. It also no longer fails when one of its pins is
+  unreachable.
+
+  `nix-thunk` still asks Nix when it cannot restate an input, and the pack then
+  takes as long as it did before. That happens in two cases:
+
+  * Upstream declares an input as a path outside its own repository.
+  * Upstream gives an input a name that Nix does not accept in a `follows`.
+
+  haskell.nix, for example, has inputs with names like `hls-1.10`. A flake can
+  declare such a name, and nothing can refer to it.
+
+* The attribute cache moved out of the thunk directory, into
+  `$XDG_CACHE_HOME/nix-thunk`. A consumer now also reads a packed thunk as a
+  flake input, so Nix hashes everything inside the thunk into that consumer's
+  `flake.lock`. A cache inside the thunk would therefore change the thunk when
+  somebody built one of its attributes. `nix-thunk` still accepts a leftover
+  `.attr-cache` directory, so an existing thunk still reads as a thunk. No code
+  writes to that directory now, and you can delete it.
+
+* Drop support for GHC older than 9.12. `Nix.Thunk.Flake` uses
+  `MultilineStrings`, and that extension requires 9.12. This release also bumps
+  the `haskell.nix` pin.
+
 * Add a `--version` option to the `nix-thunk` executable.
 
 ## 0.7.3.0
