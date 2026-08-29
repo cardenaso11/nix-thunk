@@ -110,10 +110,18 @@ rec {
     in
       if isObeliskThunkWithThunkNix then import (p + "/thunk.nix")
       else if hasValidThunk "git.json" then (
-        let gitArgs = filterArgs (builtins.fromJSON (builtins.readFile (p + "/git.json")));
-        in if builtins.elem "@" (lib.stringToCharacters gitArgs.url)
-          then pkgs.fetchgitPrivate gitArgs
-          else pkgs.fetchgit gitArgs
+        let gitJson = builtins.fromJSON (builtins.readFile (p + "/git.json"));
+            branch = gitJson.branch or null;
+            isPrivate = gitJson.private or (lib.hasInfix "@" gitJson.url);
+        # builtins.fetchGit runs in the evaluator, so it has the caller's ssh
+        # credentials.
+        in if isPrivate && !(gitJson.fetchSubmodules or false)
+          then builtins.fetchGit ({
+            inherit (gitJson) url rev;
+            allRefs = branch == null;
+          } // lib.optionalAttrs (branch != null) { ref = branch; })
+          # pkgs.fetchgit supports neither `branch` nor `private`.
+          else pkgs.fetchgit (removeAttrs gitJson [ "branch" "private" ])
         )
       else if hasValidThunk "github.json" then
         pkgs.fetchFromGitHub (filterArgs (builtins.fromJSON (builtins.readFile (p + "/github.json"))))
